@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
 """
 SolarEdge inverter monitor via Modbus TCP
-
-Features
---------
-- Uses both Astral (sunrise/sunset) and inverter status (Sleeping) to skip night checks.
-- Warns on:
-    * Low or zero production during daylight
-    * SafeDC/open-DC (low Vdc + zero Idc)
-    * Status not 2 (Sleeping) or 4 (Producing)
-    * Peer imbalance between multiple inverters
-- Exits 0 for OK/night, 2 for alerts, 1 for fatal errors.
+-----------------------------------------
+- Reads config from monitor_inverters.conf (key=value format)
+- Detects low/zero production, SafeDC conditions, and abnormal statuses
+- Uses Astral for daylight logic
+- Sends Pushover notifications on alerts
 """
 
 import os
@@ -18,6 +13,8 @@ import sys
 import json
 import socket
 from datetime import datetime, timedelta
+import urllib.request
+import urllib.parse
 
 import pytz
 from astral import LocationInfo
@@ -25,34 +22,92 @@ from astral.sun import sun
 import solaredge_modbus
 
 
-# ---------------------- CONFIG ----------------------
+# ---------------- CONFIG LOADING ----------------
 
-INVERTERS = [
-    {"name": "SE10000H", "host": "192.168.3.50", "port": 1502, "unit": 1},
-    {"name": "SE7600H", "host": "192.168.3.51", "port": 1502, "unit": 1},
-]
+def load_config(path="monitor_inverters.conf"):
+    """Read key=value pairs into os.environ (non-overwriting)."""
+    if not os.path.exists(path):
+        print(f"⚠️ Config file not found: {path}", file=sys.stderr)
+        return
 
-LAT = float(os.getenv("LAT", "39.0716"))
-LON = float(os.getenv("LON", "-77.1496"))
-TZNAME = os.getenv("TZ", "America/New_York")
-CITY_NAME = os.getenv("CITY_NAME", "Rockville, MD")
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, val = [x.strip() for x in line.split("=", 1)]
+            os.environ.setdefault(key, val)
 
-MORNING_GRACE = timedelta(minutes=20)
-EVENING_GRACE = timedelta(minutes=10)
 
-ABS_MIN_WATTS = 150.0
-SAFE_DC_VOLT_MAX = 150.0
-ZERO_CURRENT_EPS = 0.05
+load_config()  # load config before reading env vars
 
-PEER_COMPARE = True
-PEER_MIN_WATTS = 600.0
-PEER_LOW_RATIO = 0.20
+
+# ---------------- CONFIG VALUES ----------------
+
+def get_bool(var, default=False):
+    val = os.getenv(var, str(default))
+    return str(val).lower() in ("1", "true", "yes", "on")
+
+CITY_NAME = os.getenv("CITY_NAME", "Local")
+LAT = float(os.getenv("LAT", "40.7128"))
+LON = float(os.getenv("LON", "-74.0060"))
+TZNAME = os.getenv("TZNAME", "America/New_York")
+
+MORNING_GRACE = timedelta(minutes=float(os.getenv("MORNING_GRACE_MIN", 20)))
+EVENING_GRACE = timedelta(minutes=float(os.getenv("EVENING_GRACE_MIN", 10)))
+
+ABS_MIN_WATTS = float(os.getenv("ABS_MIN_WATTS", 150))
+SAFE_DC_VOLT_MAX = float(os.getenv("SAFE_DC_VOLT_MAX", 150))
+ZERO_CURRENT_EPS = float(os.getenv("ZERO_CURRENT_EPS", 0.05))
+
+PEER_COMPARE = get_bool("PEER_COMPARE", True)
+PEER_MIN_WATTS = float(os.getenv("PEER_MIN_WATTS", 600))
+PEER_LOW_RATIO = float(os.getenv("PEER_LOW_RATIO", 0.20))
 
 DEFAULT_VERBOSE = False
 MODBUS_TIMEOUT = 2
 MODBUS_UNIT = 1
 
-# ----------------------------------------------------
+# Parse inverter list: "name:ip:port:unit"
+INVERTERS = []
+inv_list = os.getenv("INVERTERS", "")
+for part in inv_list.split(","):
+    part = part.strip()
+    if not part:
+        continue
+    name, host, port, unit = [x.strip() for x in part.split(":")]
+    INVERTERS.append({
+        "name": name,
+        "host": host,
+        "port": int(port),
+        "unit": int(unit),
+    })
+
+
+# ---------------- UTILITIES ----------------
+
+def pushover_notify(title: str, message: str, priority: int = 0):
+    """Send a Pushover notification if credentials are configured."""
+    user = os.getenv("PUSHOVER_USER_KEY")
+    token = os.getenv("PUSHOVER_API_TOKEN")
+    if not user or not token:
+        return  # silently skip if not configured
+
+    data = urllib.parse.urlencode({
+        "token": token,
+        "user": user,
+        "title": title,
+        "message": message,
+        "priority": str(priority),
+    }).encode("utf-8")
+
+    try:
+        req = urllib.request.Request("https://api.pushover.net/1/messages.json", data=data)
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as e:
+        print(f"⚠️ Failed to send Pushover alert: {e}", file=sys.stderr)
 
 
 def now_local():
@@ -82,15 +137,6 @@ def scaled(values, name):
 
 def status_text(code: int) -> str:
     """Return descriptive status name."""
-    mapping = getattr(solaredge_modbus, "INVERTER_STATUS_MAP", None)
-    if isinstance(mapping, dict):
-        text = mapping.get(code)
-    elif isinstance(mapping, (list, tuple)) and isinstance(code, int):
-        text = mapping[code] if 0 <= code < len(mapping) else None
-    else:
-        text = None
-
-    # Fallback explicit mapping (always available)
     explicit = {
         1: "Off",
         2: "Sleeping",
@@ -101,7 +147,7 @@ def status_text(code: int) -> str:
         7: "Fault",
         8: "Standby",
     }
-    return text or explicit.get(code, f"Unknown({code})")
+    return explicit.get(code, f"Unknown({code})")
 
 
 def read_inverter(inv, verbose=False):
@@ -143,29 +189,24 @@ def read_inverter(inv, verbose=False):
 def detect_anomalies(results):
     """Return list of alert strings based on status and power rules."""
     alerts = []
-
     for r in results:
         st, st_txt = r["status"], status_text(r["status"])
         pac, vdc, idc = r["pac_W"], r["vdc_V"], r["idc_A"]
 
-        # --- 1. Faulty status code ---
         if st not in (2, 4):
             alerts.append(f"{r['id']}: Abnormal status ({st_txt})")
 
-        # --- 2. SafeDC / open string heuristic ---
         if vdc is not None and idc is not None:
             if abs(idc) <= ZERO_CURRENT_EPS and vdc < SAFE_DC_VOLT_MAX:
                 alerts.append(
                     f"{r['id']}: SafeDC/open-DC suspected (Vdc={vdc:.1f}V, Idc≈0A, status={st_txt})"
                 )
 
-        # --- 3. Low power during daylight ---
         if pac is not None and pac < ABS_MIN_WATTS and st == 4:
             alerts.append(
                 f"{r['id']}: Low production (PAC={pac:.0f}W < {ABS_MIN_WATTS:.0f}W, status={st_txt})"
             )
 
-    # --- 4. Peer comparison ---
     if PEER_COMPARE and len(results) >= 2:
         pacs = [r["pac_W"] for r in results if r["pac_W"] is not None]
         if pacs and max(pacs) >= PEER_MIN_WATTS:
@@ -180,18 +221,17 @@ def detect_anomalies(results):
                         f"{r['id']}: Under peer median (PAC={pac:.0f}W < {threshold:.0f}W, peers median≈{med:.0f}W)"
                     )
 
-    # Merge duplicates
     merged = {}
     for msg in alerts:
         key = msg.split(":")[0]
         merged.setdefault(key, []).append(msg)
-    output = []
+    out = []
     for k, msgs in merged.items():
         if len(msgs) == 1:
-            output.append(msgs[0])
+            out.append(msgs[0])
         else:
-            output.append(f"{k}: " + " | ".join(m.split(": ", 1)[1] for m in msgs))
-    return output
+            out.append(f"{k}: " + " | ".join(m.split(": ", 1)[1] for m in msgs))
+    return out
 
 
 def main():
@@ -205,8 +245,8 @@ def main():
     is_day, sunrise, sunset = solar_window(dt)
 
     if args.verbose:
-        print(f"[time] now={dt.strftime('%Y-%m-%d %H:%M:%S %Z')}  day={is_day}  "
-              f"sunrise+grace={sunrise.strftime('%H:%M')}  sunset-grace={sunset.strftime('%H:%M')}")
+        print(f"[time] now={dt.strftime('%Y-%m-%d %H:%M:%S %Z')} day={is_day} "
+              f"sunrise+grace={sunrise.strftime('%H:%M')} sunset-grace={sunset.strftime('%H:%M')}")
 
     results, any_success = [], False
     for inv in INVERTERS:
@@ -215,9 +255,8 @@ def main():
             results.append(r)
             any_success = True
             if args.verbose:
-                st_txt = status_text(r["status"])
-                print(f"[{r['id']}] PAC={r['pac_W']:.0f}W  Vdc={r['vdc_V']:.1f}V  "
-                      f"Idc={r['idc_A']:.2f}A  status={st_txt}")
+                print(f"[{r['id']}] PAC={r['pac_W']:.0f}W Vdc={r['vdc_V']:.1f}V "
+                      f"Idc={r['idc_A']:.2f}A status={status_text(r['status'])}")
         except Exception:
             results.append({"id": inv["name"], "error": True})
 
@@ -228,7 +267,6 @@ def main():
         print("ERROR: no inverter responded", file=sys.stderr)
         return 1
 
-    # Night skip: if ALL inverters report Sleeping (2) OR Astral night
     all_sleeping = all(r.get("status") == 2 for r in results if not r.get("error"))
     if all_sleeping or not is_day:
         if args.verbose:
@@ -244,8 +282,9 @@ def main():
             alerts.append(f"{r['id']}: Modbus read failed")
 
     if alerts:
-        for a in alerts:
-            print(f"ALERT: {a}")
+        msg = "\n".join(alerts)
+        print(f"ALERT:\n{msg}")
+        pushover_notify("SolarEdge Monitor Alert", msg, priority=1)
         return 2
 
     if args.verbose:

@@ -1,0 +1,52 @@
+# --- OS / Editor junk ---
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+*.bak
+*.tmp
+
+# --- Logs ---
+*.log
+*.err
+*.out
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+.venv/
+env/
+venv/
+ENV/
+
+# --- Node.js (if you dabble) ---
+node_modules/
+
+# --- Compiled binaries ---
+*.o
+*.so
+*.exe
+*.dll
+*.class
+
+# --- Archives ---
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+
+# --- Secrets / Config ---
+.env
+*.conf
+*.key
+*.pem
+*.crt
+*.secret
+*.password
+*.token
