@@ -147,6 +147,8 @@ def status_text(code: int) -> str:
         7: "Fault",
         8: "Standby",
     }
+    if code is None:
+        return "No status (unavailable)"
     return explicit.get(code, f"Unknown({code})")
 
 
@@ -192,6 +194,9 @@ def detect_anomalies(results):
     for r in results:
         st, st_txt = r["status"], status_text(r["status"])
         pac, vdc, idc = r["pac_W"], r["vdc_V"], r["idc_A"]
+
+        if st in (1, 2) or st is None:
+            continue
 
         if st not in (2, 4):
             alerts.append(f"{r['id']}: Abnormal status ({st_txt})")

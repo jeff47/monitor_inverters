@@ -1,0 +1,25 @@
+# --- Site & Location ---
+CITY_NAME = Washington, D.C.
+LAT = 38.8977
+LON = -77.0365
+TZNAME = America/New_York
+
+# --- Inverters ---
+# Comma-separated list of inverters in "name:ip:port:unit" format
+INVERTERS = SE10000H:192.168.3.50:1502:1, SE7600H:192.168.3.51:1502:1
+
+# --- Thresholds ---
+MORNING_GRACE_MIN = 20
+EVENING_GRACE_MIN = 10
+ABS_MIN_WATTS = 150
+SAFE_DC_VOLT_MAX = 150
+ZERO_CURRENT_EPS = 0.05
+PEER_COMPARE = True
+PEER_MIN_WATTS = 600
+PEER_LOW_RATIO = 0.20
+
+# --- Pushover ---
+PUSHOVER_USER_KEY = XXXX
+PUSHOVER_API_TOKEN = YYYY
+
+
