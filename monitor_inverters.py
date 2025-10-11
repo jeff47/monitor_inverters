@@ -1,79 +1,58 @@
 #!/usr/bin/env python3
 """
-SolarEdge inverter monitor via Modbus TCP
------------------------------------------
-- Reads config from monitor_inverters.conf (key=value format)
+SolarEdge inverter monitor via Modbus TCP + optional Cloud API
+--------------------------------------------------------------
+- Reads config from monitor_inverters.conf (INI format)
 - Detects low/zero production, SafeDC conditions, and abnormal statuses
 - Uses Astral for daylight logic
 - Sends Pushover notifications on alerts
+- Optionally validates inverter/optimizer reporting via SolarEdge cloud API
+- Supports repeated-detection filtering (X detections over Y minutes)
 """
 
 import os
 import sys
 import json
 import socket
+import time
 from datetime import datetime, timedelta
 import urllib.request
 import urllib.parse
-
 import pytz
+import configparser
+import solaredge_modbus
 from astral import LocationInfo
 from astral.sun import sun
-import solaredge_modbus
+import requests
+import datetime as dt
 
 
 # ---------------- CONFIG LOADING ----------------
 
 def load_config(path="monitor_inverters.conf"):
-    """Read key=value pairs into os.environ (non-overwriting)."""
+    """Read configuration from INI file using configparser."""
+    parser = configparser.ConfigParser()
+    parser.optionxform = str  # preserve case
     if not os.path.exists(path):
         print(f"⚠️ Config file not found: {path}", file=sys.stderr)
-        return
-
-    with open(path, "r") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if "=" not in line:
-                continue
-            key, val = [x.strip() for x in line.split("=", 1)]
-            os.environ.setdefault(key, val)
+        sys.exit(1)
+    parser.read(path)
+    return parser
 
 
-load_config()  # load config before reading env vars
+cfg = load_config()
 
 
 # ---------------- CONFIG VALUES ----------------
 
-def get_bool(var, default=False):
-    val = os.getenv(var, str(default))
-    return str(val).lower() in ("1", "true", "yes", "on")
+CITY_NAME = cfg.get("site", "CITY_NAME")
+LAT = cfg.getfloat("site", "LAT")
+LON = cfg.getfloat("site", "LON")
+TZNAME = cfg.get("site", "TZNAME")
 
-CITY_NAME = os.getenv("CITY_NAME", "Local")
-LAT = float(os.getenv("LAT", "40.7128"))
-LON = float(os.getenv("LON", "-74.0060"))
-TZNAME = os.getenv("TZNAME", "America/New_York")
-
-MORNING_GRACE = timedelta(minutes=float(os.getenv("MORNING_GRACE_MIN", 20)))
-EVENING_GRACE = timedelta(minutes=float(os.getenv("EVENING_GRACE_MIN", 10)))
-
-ABS_MIN_WATTS = float(os.getenv("ABS_MIN_WATTS", 150))
-SAFE_DC_VOLT_MAX = float(os.getenv("SAFE_DC_VOLT_MAX", 150))
-ZERO_CURRENT_EPS = float(os.getenv("ZERO_CURRENT_EPS", 0.05))
-
-PEER_COMPARE = get_bool("PEER_COMPARE", True)
-PEER_MIN_WATTS = float(os.getenv("PEER_MIN_WATTS", 600))
-PEER_LOW_RATIO = float(os.getenv("PEER_LOW_RATIO", 0.20))
-
-DEFAULT_VERBOSE = False
-MODBUS_TIMEOUT = 2
-MODBUS_UNIT = 1
-
-# Parse inverter list: "name:ip:port:unit"
+# Inverters
 INVERTERS = []
-inv_list = os.getenv("INVERTERS", "")
-for part in inv_list.split(","):
+for part in cfg.get("inverters", "INVERTERS").split(","):
     part = part.strip()
     if not part:
         continue
@@ -85,19 +64,41 @@ for part in inv_list.split(","):
         "unit": int(unit),
     })
 
+# Thresholds
+MORNING_GRACE = timedelta(minutes=cfg.getfloat("thresholds", "MORNING_GRACE_MIN", fallback=20))
+EVENING_GRACE = timedelta(minutes=cfg.getfloat("thresholds", "EVENING_GRACE_MIN", fallback=10))
+ABS_MIN_WATTS = cfg.getfloat("thresholds", "ABS_MIN_WATTS", fallback=150)
+SAFE_DC_VOLT_MAX = cfg.getfloat("thresholds", "SAFE_DC_VOLT_MAX", fallback=150)
+ZERO_CURRENT_EPS = cfg.getfloat("thresholds", "ZERO_CURRENT_EPS", fallback=0.05)
+PEER_COMPARE = cfg.getboolean("thresholds", "PEER_COMPARE", fallback=True)
+PEER_MIN_WATTS = cfg.getfloat("thresholds", "PEER_MIN_WATTS", fallback=600)
+PEER_LOW_RATIO = cfg.getfloat("thresholds", "PEER_LOW_RATIO", fallback=0.20)
+
+# Alert repetition
+ALERT_REPEAT_COUNT = cfg.getint("alerts", "ALERT_REPEAT_COUNT", fallback=3)
+ALERT_REPEAT_WINDOW_MIN = cfg.getint("alerts", "ALERT_REPEAT_WINDOW_MIN", fallback=30)
+ALERT_STATE_FILE = cfg.get("alerts", "ALERT_STATE_FILE", fallback="/tmp/inverter_alert_state.json")
+
+# Pushover
+PUSHOVER_USER_KEY = cfg.get("pushover", "PUSHOVER_USER_KEY", fallback=None)
+PUSHOVER_API_TOKEN = cfg.get("pushover", "PUSHOVER_API_TOKEN", fallback=None)
+
+# SolarEdge Cloud API
+ENABLE_SOLAREDGE_API = cfg.getboolean("solaredge_api", "ENABLE_SOLAREDGE_API", fallback=False)
+SOLAREDGE_API_KEY = cfg.get("solaredge_api", "SOLAREDGE_API_KEY", fallback=None)
+SOLAREDGE_SITE_ID = cfg.get("solaredge_api", "SOLAREDGE_SITE_ID", fallback=None)
+
 
 # ---------------- UTILITIES ----------------
 
 def pushover_notify(title: str, message: str, priority: int = 0):
     """Send a Pushover notification if credentials are configured."""
-    user = os.getenv("PUSHOVER_USER_KEY")
-    token = os.getenv("PUSHOVER_API_TOKEN")
-    if not user or not token:
-        return  # silently skip if not configured
+    if not PUSHOVER_USER_KEY or not PUSHOVER_API_TOKEN:
+        return
 
     data = urllib.parse.urlencode({
-        "token": token,
-        "user": user,
+        "token": PUSHOVER_API_TOKEN,
+        "user": PUSHOVER_USER_KEY,
         "title": title,
         "message": message,
         "priority": str(priority),
@@ -147,8 +148,6 @@ def status_text(code: int) -> str:
         7: "Fault",
         8: "Standby",
     }
-    if code is None:
-        return "No status (unavailable)"
     return explicit.get(code, f"Unknown({code})")
 
 
@@ -158,15 +157,15 @@ def read_inverter(inv, verbose=False):
         socket.gethostbyname(inv["host"])
         inverter = solaredge_modbus.Inverter(
             host=inv["host"],
-            port=inv.get("port", 1502),
-            timeout=MODBUS_TIMEOUT,
-            unit=inv.get("unit", MODBUS_UNIT),
+            port=inv["port"],
+            timeout=2,
+            unit=inv["unit"],
         )
         v = inverter.read_all()
     except Exception as e:
         if verbose:
             print(f"[{inv['name']}] ERROR reading inverter: {e}", file=sys.stderr)
-        raise
+        return {"id": inv["name"], "error": True}
 
     model = v.get("c_model") or v.get("model")
     serial = v.get("c_serialnumber") or v.get("serialnumber")
@@ -188,6 +187,40 @@ def read_inverter(inv, verbose=False):
     }
 
 
+# ---------------- ALERT REPETITION CONTROL ----------------
+
+def load_alert_state():
+    try:
+        with open(ALERT_STATE_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_alert_state(state):
+    try:
+        with open(ALERT_STATE_FILE, "w") as f:
+            json.dump(state, f)
+    except Exception as e:
+        print(f"⚠️ Failed to save alert state: {e}", file=sys.stderr)
+
+
+def should_alert(key):
+    """Return True if alert should be triggered now (after X/Y rule)."""
+    state = load_alert_state()
+    now = time.time()
+    record = state.get(key, {"count": 0, "first": now})
+    # Reset if outside time window
+    if now - record["first"] > ALERT_REPEAT_WINDOW_MIN * 60:
+        record = {"count": 0, "first": now}
+    record["count"] += 1
+    state[key] = record
+    save_alert_state(state)
+    return record["count"] >= ALERT_REPEAT_COUNT
+
+
+# ---------------- DETECTION ----------------
+
 def detect_anomalies(results):
     """Return list of alert strings based on status and power rules."""
     alerts = []
@@ -195,22 +228,15 @@ def detect_anomalies(results):
         st, st_txt = r["status"], status_text(r["status"])
         pac, vdc, idc = r["pac_W"], r["vdc_V"], r["idc_A"]
 
-        if st in (1, 2) or st is None:
-            continue
-
         if st not in (2, 4):
             alerts.append(f"{r['id']}: Abnormal status ({st_txt})")
 
         if vdc is not None and idc is not None:
             if abs(idc) <= ZERO_CURRENT_EPS and vdc < SAFE_DC_VOLT_MAX:
-                alerts.append(
-                    f"{r['id']}: SafeDC/open-DC suspected (Vdc={vdc:.1f}V, Idc≈0A, status={st_txt})"
-                )
+                alerts.append(f"{r['id']}: SafeDC/open-DC suspected (Vdc={vdc:.1f}V, Idc≈0A, status={st_txt})")
 
         if pac is not None and pac < ABS_MIN_WATTS and st == 4:
-            alerts.append(
-                f"{r['id']}: Low production (PAC={pac:.0f}W < {ABS_MIN_WATTS:.0f}W, status={st_txt})"
-            )
+            alerts.append(f"{r['id']}: Low production (PAC={pac:.0f}W < {ABS_MIN_WATTS:.0f}W, status={st_txt})")
 
     if PEER_COMPARE and len(results) >= 2:
         pacs = [r["pac_W"] for r in results if r["pac_W"] is not None]
@@ -222,9 +248,7 @@ def detect_anomalies(results):
                 if pac is None:
                     continue
                 if pac < threshold:
-                    alerts.append(
-                        f"{r['id']}: Under peer median (PAC={pac:.0f}W < {threshold:.0f}W, peers median≈{med:.0f}W)"
-                    )
+                    alerts.append(f"{r['id']}: Under peer median (PAC={pac:.0f}W < {threshold:.0f}W, peers median≈{med:.0f}W)")
 
     merged = {}
     for msg in alerts:
@@ -239,31 +263,85 @@ def detect_anomalies(results):
     return out
 
 
+# ---------------- SOLAREDGE API CHECK ----------------
+
+def check_solaredge_api():
+    """Check inverter and optimizer reporting via SolarEdge cloud API."""
+    if not ENABLE_SOLAREDGE_API:
+        return []
+
+    if not SOLAREDGE_API_KEY or not SOLAREDGE_SITE_ID:
+        return ["SolarEdge API not configured (missing SOLAREDGE_SITE_ID or SOLAREDGE_API_KEY)"]
+
+    base_url = "https://monitoringapi.solaredge.com"
+    alerts = []
+    now = dt.datetime.now(dt.timezone.utc)
+    start = (now - dt.timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+    end = now.strftime("%Y-%m-%d %H:%M:%S")
+
+    def get_json(url):
+        try:
+            r = requests.get(url, timeout=15)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            alerts.append(f"SolarEdge API error: {e}")
+            return None
+
+    eq_url = f"{base_url}/equipment/{SOLAREDGE_SITE_ID}/list.json?api_key={SOLAREDGE_API_KEY}"
+    data = get_json(eq_url)
+    if not data:
+        return alerts
+    reporters = data.get("reporters", [])
+    if not reporters:
+        alerts.append("No equipment found via SolarEdge API.")
+        return alerts
+
+    for r in reporters:
+        serial = r.get("serialNumber")
+        name = r.get("name", serial)
+        model = r.get("model", "")
+        url = (f"{base_url}/equipment/{SOLAREDGE_SITE_ID}/{serial}/data.json"
+               f"?startTime={start}&endTime={end}&api_key={SOLAREDGE_API_KEY}")
+        d = get_json(url)
+        if not d or "data" not in d:
+            alerts.append(f"{model} ({serial}): No data available from SolarEdge API.")
+            continue
+        datapoints = d.get("data", [])
+        if len(datapoints) == 0:
+            alerts.append(f"{model} ({serial}): No production data in past hour.")
+        else:
+            total_wh = sum(x.get("value", 0) for x in datapoints if isinstance(x, dict))
+            if total_wh == 0:
+                alerts.append(f"{model} ({serial}): Optimizers reporting zero Wh (possible fault).")
+    return alerts
+
+
+# ---------------- MAIN ----------------
+
 def main():
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--json", action="store_true")
-    ap.add_argument("--verbose", action="store_true", default=DEFAULT_VERBOSE)
+    ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
-    dt = now_local()
-    is_day, sunrise, sunset = solar_window(dt)
+    dt_local = now_local()
+    is_day, sunrise, sunset = solar_window(dt_local)
 
     if args.verbose:
-        print(f"[time] now={dt.strftime('%Y-%m-%d %H:%M:%S %Z')} day={is_day} "
+        print(f"[time] now={dt_local.strftime('%Y-%m-%d %H:%M:%S %Z')} day={is_day} "
               f"sunrise+grace={sunrise.strftime('%H:%M')} sunset-grace={sunset.strftime('%H:%M')}")
 
     results, any_success = [], False
     for inv in INVERTERS:
-        try:
-            r = read_inverter(inv, verbose=args.verbose)
-            results.append(r)
+        r = read_inverter(inv, verbose=args.verbose)
+        results.append(r)
+        if not r.get("error"):
             any_success = True
             if args.verbose:
                 print(f"[{r['id']}] PAC={r['pac_W']:.0f}W Vdc={r['vdc_V']:.1f}V "
                       f"Idc={r['idc_A']:.2f}A status={status_text(r['status'])}")
-        except Exception:
-            results.append({"id": inv["name"], "error": True})
 
     if args.json:
         print(json.dumps(results, indent=2, default=str))
@@ -286,11 +364,28 @@ def main():
         if r.get("error"):
             alerts.append(f"{r['id']}: Modbus read failed")
 
+    # --- Cloud API checks ---
+    cloud_alerts = check_solaredge_api()
+    if cloud_alerts:
+        print("Cloud API Alerts:")
+        for a in cloud_alerts:
+            print("  -", a)
+        alerts.extend(cloud_alerts)
+
     if alerts:
-        msg = "\n".join(alerts)
-        print(f"ALERT:\n{msg}")
-        pushover_notify("SolarEdge Monitor Alert", msg, priority=1)
-        return 2
+        confirmed = []
+        for msg in alerts:
+            if should_alert(msg.split(":")[0]):
+                confirmed.append(msg)
+        if confirmed:
+            msg = "\n".join(confirmed)
+            print(f"ALERT:\n{msg}")
+            pushover_notify("SolarEdge Monitor Alert", msg, priority=1)
+            return 2
+        else:
+            if args.verbose:
+                print("(Alerts suppressed until repeated)")
+            return 0
 
     if args.verbose:
         print("OK: all inverters normal.")
