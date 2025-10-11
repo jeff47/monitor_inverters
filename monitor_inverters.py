@@ -8,7 +8,7 @@ SolarEdge inverter monitor via Modbus TCP + optional Cloud API
 - Sends Pushover notifications on alerts
 - Optionally validates inverter/optimizer reporting via SolarEdge cloud API
 - Supports repeated-detection filtering (X detections over Y minutes)
-- Supports --simulate mode to safely test alerts
+- Supports --simulate mode to safely test alerts and suppression
 """
 
 import os
@@ -26,6 +26,8 @@ from astral import LocationInfo
 from astral.sun import sun
 import requests
 import datetime as dt
+import argparse
+from argparse import RawTextHelpFormatter
 
 
 # ---------------- CONFIG LOADING ----------------
@@ -207,10 +209,14 @@ def save_alert_state(state):
 
 
 def should_alert(key):
-    """Return True if alert should be triggered now (after X/Y rule)."""
+    """
+    Return True if alert for 'key' should be triggered now (after X/Y rule).
+    'key' is typically the inverter identifier prefix before the colon.
+    """
     state = load_alert_state()
     now = time.time()
     record = state.get(key, {"count": 0, "first": now})
+    # Reset if outside time window
     if now - record["first"] > ALERT_REPEAT_WINDOW_MIN * 60:
         record = {"count": 0, "first": now}
     record["count"] += 1
@@ -299,7 +305,6 @@ def check_solaredge_api():
 
     for r in reporters:
         serial = r.get("serialNumber")
-        name = r.get("name", serial)
         model = r.get("model", "")
         url = (f"{base_url}/equipment/{SOLAREDGE_SITE_ID}/{serial}/data.json"
                f"?startTime={start}&endTime={end}&api_key={SOLAREDGE_API_KEY}")
@@ -319,13 +324,40 @@ def check_solaredge_api():
 
 # ---------------- MAIN ----------------
 
-def main():
-    import argparse
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--json", action="store_true")
-    ap.add_argument("--verbose", action="store_true")
+def build_arg_parser():
+    examples = """\
+Examples:
+  Normal run (verbose):
+    python3 monitor_inverters.py --verbose
+
+  Output raw JSON for one run:
+    python3 monitor_inverters.py --json
+
+  Simulate issues (no hardware changes needed):
+    python3 monitor_inverters.py --simulate low --verbose
+    python3 monitor_inverters.py --simulate fault
+    python3 monitor_inverters.py --simulate offline
+
+  Cron-friendly (no output unless alert fires):
+    */5 * * * * /usr/bin/python3 /path/monitor_inverters.py
+"""
+    ap = argparse.ArgumentParser(
+        description="Monitor SolarEdge inverters via Modbus + optional Cloud API.\n"
+                    "Sends alerts only after repeated detections (X over Y).",
+        formatter_class=RawTextHelpFormatter,
+        epilog=examples
+    )
+    ap.add_argument("--json", action="store_true",
+                    help="print full inverter readings as JSON and exit")
+    ap.add_argument("--verbose", action="store_true",
+                    help="emit detailed logs during checks")
     ap.add_argument("--simulate", choices=["off", "low", "fault", "offline"], default="off",
-                    help="simulate inverter failure for testing (default: off)")
+                    help="simulate a failure mode on the first inverter (default: off)")
+    return ap
+
+
+def main():
+    ap = build_arg_parser()
     args = ap.parse_args()
 
     dt_local = now_local()
@@ -350,6 +382,8 @@ def main():
         target = results[0]
         if args.simulate == "low":
             target["pac_W"] = 0.0
+            if "status" not in target or target.get("status") is None:
+                target["status"] = 4  # make it look like "Producing" but 0W
             print(f"(Simulation) {target['id']} forced to 0W output")
         elif args.simulate == "fault":
             target["status"] = 7  # Fault
@@ -360,6 +394,7 @@ def main():
 
     if args.json:
         print(json.dumps(results, indent=2, default=str))
+        return 0
 
     if not any_success:
         print("ERROR: no inverter responded", file=sys.stderr)
@@ -390,7 +425,8 @@ def main():
     if alerts:
         confirmed = []
         for msg in alerts:
-            if should_alert(msg.split(":")[0]):
+            key = msg.split(":")[0]
+            if should_alert(key):
                 confirmed.append(msg)
         if confirmed:
             msg = "\n".join(confirmed)
@@ -398,8 +434,7 @@ def main():
             pushover_notify("SolarEdge Monitor Alert", msg, priority=1)
             return 2
         else:
-            if args.verbose:
-                print("(Alerts suppressed until repeated)")
+            # Suppressed (not repeated enough within the window)
             return 0
 
     if args.verbose:
