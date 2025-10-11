@@ -8,6 +8,7 @@ SolarEdge inverter monitor via Modbus TCP + optional Cloud API
 - Sends Pushover notifications on alerts
 - Optionally validates inverter/optimizer reporting via SolarEdge cloud API
 - Supports repeated-detection filtering (X detections over Y minutes)
+- Supports --simulate mode to safely test alerts
 """
 
 import os
@@ -210,7 +211,6 @@ def should_alert(key):
     state = load_alert_state()
     now = time.time()
     record = state.get(key, {"count": 0, "first": now})
-    # Reset if outside time window
     if now - record["first"] > ALERT_REPEAT_WINDOW_MIN * 60:
         record = {"count": 0, "first": now}
     record["count"] += 1
@@ -324,6 +324,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--simulate", choices=["off", "low", "fault", "offline"], default="off",
+                    help="simulate inverter failure for testing (default: off)")
     args = ap.parse_args()
 
     dt_local = now_local()
@@ -342,6 +344,19 @@ def main():
             if args.verbose:
                 print(f"[{r['id']}] PAC={r['pac_W']:.0f}W Vdc={r['vdc_V']:.1f}V "
                       f"Idc={r['idc_A']:.2f}A status={status_text(r['status'])}")
+
+    # --- Simulation injection ---
+    if args.simulate != "off" and results:
+        target = results[0]
+        if args.simulate == "low":
+            target["pac_W"] = 0.0
+            print(f"(Simulation) {target['id']} forced to 0W output")
+        elif args.simulate == "fault":
+            target["status"] = 7  # Fault
+            print(f"(Simulation) {target['id']} forced to FAULT state")
+        elif args.simulate == "offline":
+            target["error"] = True
+            print(f"(Simulation) {target['id']} marked as unreachable")
 
     if args.json:
         print(json.dumps(results, indent=2, default=str))
