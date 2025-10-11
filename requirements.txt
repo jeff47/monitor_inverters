@@ -1,0 +1,11 @@
+
+---
+
+### 📄 `requirements.txt`
+
+```txt
+astral>=3.2
+pytz>=2023.3
+pymodbus==3.6.8
+requests>=2.31
+solaredge_modbus>=0.8.1
