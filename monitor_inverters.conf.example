@@ -1,14 +1,14 @@
-# --- Site & Location ---
-CITY_NAME = Washington, D.C.
+[site]
+CITY_NAME = Washington, DC
 LAT = 38.8977
 LON = -77.0365
 TZNAME = America/New_York
 
-# --- Inverters ---
-# Comma-separated list of inverters in "name:ip:port:unit" format
-INVERTERS = SE10000H:192.168.3.50:1502:1, SE7600H:192.168.3.51:1502:1
+[inverters]
+# Comma-separated list in "name:ip:port:unit" format
+INVERTERS = SE10000H:192.168.1.50:1502:1, SE7600H:192.168.1.51:1502:1
 
-# --- Thresholds ---
+[thresholds]
 MORNING_GRACE_MIN = 20
 EVENING_GRACE_MIN = 10
 ABS_MIN_WATTS = 150
@@ -18,8 +18,16 @@ PEER_COMPARE = True
 PEER_MIN_WATTS = 600
 PEER_LOW_RATIO = 0.20
 
-# --- Pushover ---
+[alerts]
+ALERT_REPEAT_COUNT = 3
+ALERT_REPEAT_WINDOW_MIN = 30
+ALERT_STATE_FILE = /tmp/inverter_alert_state.json
+
+[pushover]
 PUSHOVER_USER_KEY = XXXX
 PUSHOVER_API_TOKEN = YYYY
 
-
+[solaredge_api]
+ENABLE_SOLAREDGE_API = True
+SOLAREDGE_API_KEY = ZZZZZ
+SOLAREDGE_SITE_ID = 123456
