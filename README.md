@@ -79,6 +79,7 @@ PEER_LOW_RATIO = 0.20
 ALERT_REPEAT_COUNT = 3
 ALERT_REPEAT_WINDOW_MIN = 30
 ALERT_STATE_FILE = /tmp/inverter_alert_state.json
+HEALTHCHECKS_URL = https://hc-ping.com/XXXXXX/solaredge
 
 [pushover]
 PUSHOVER_USER_KEY = XXXXXX
@@ -109,7 +110,8 @@ SOLAREDGE_SITE_ID = 123456
 | **[alerts]**        | `ALERT_REPEAT_COUNT`      | Number of consecutive detections required before alert | Integer (e.g. `3`)                                                |
 |        | `ALERT_REPEAT_WINDOW_MIN` | Time window for repeated detections                    | Integer minutes (e.g. `30`)                                       |
 |         | `ALERT_STATE_FILE`        | JSON file storing persistent alert state               | Valid file path (e.g. `/tmp/inverter_alert_state.json`)           |
-| **[pushover]**      | `PUSHOVER_USER_KEY`       | User key from your Pushover account                    | 30–40 character alphanumeric string                               |
+| | `HEALTHCHECKS_URL` | URL to Healthchecks | Valid URL (leave blank to disable)
+| **[pushover]**      | `PUSHOVER_USER_KEY`       | User key from your Pushover account                    | 30–40 character alphanumeric string (leave blank to disable)                              |
 |       | `PUSHOVER_API_TOKEN`      | API token from your Pushover app                       | 30–40 character alphanumeric string                               |
 | **[solaredge_api]** | `ENABLE_SOLAREDGE_API`    | Enable optional SolarEdge Cloud API checks             | `True` / `False`                                                  |
 |  | `SOLAREDGE_API_KEY`       | SolarEdge Cloud API key                                | 32-character alphanumeric                                         |
