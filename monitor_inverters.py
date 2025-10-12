@@ -4,11 +4,12 @@ SolarEdge inverter monitor via Modbus TCP + optional Cloud API
 --------------------------------------------------------------
 - Reads config from monitor_inverters.conf (INI format)
 - Detects low/zero production, SafeDC conditions, and abnormal statuses
-- Uses Astral for daylight logic
+- Uses Astral for daylight logic (cached)
 - Sends Pushover notifications on alerts
-- Optionally validates inverter/optimizer reporting via SolarEdge cloud API
+- Optionally validates inverter/optimizer reporting via SolarEdge Cloud API
 - Supports repeated-detection filtering (X detections over Y minutes)
 - Supports --simulate mode to safely test alerts and suppression
+- Supports --quiet for cron-friendly output
 """
 
 import os
@@ -16,9 +17,9 @@ import sys
 import json
 import socket
 import time
-from datetime import datetime, timedelta
 import urllib.request
 import urllib.parse
+import urllib.error
 import pytz
 import configparser
 import solaredge_modbus
@@ -26,8 +27,10 @@ from astral import LocationInfo
 from astral.sun import sun
 import requests
 import datetime as dt
+from datetime import datetime, timedelta
 import argparse
 from argparse import RawTextHelpFormatter
+from urllib.parse import urlparse, urlunparse, urlencode
 
 
 # ---------------- CONFIG LOADING ----------------
@@ -46,50 +49,70 @@ def load_config(path="monitor_inverters.conf"):
 cfg = load_config()
 
 
+def get_cfg(section, key, fallback=None, cast=None):
+    """Safer config accessor with fallback and optional casting."""
+    try:
+        val = cfg.get(section, key, fallback=fallback)
+        if cast and val is not None:
+            return cast(val)
+        return val
+    except (configparser.NoSectionError, configparser.NoOptionError):
+        return fallback
+
+
 # ---------------- CONFIG VALUES ----------------
 
-CITY_NAME = cfg.get("site", "CITY_NAME")
-LAT = cfg.getfloat("site", "LAT")
-LON = cfg.getfloat("site", "LON")
-TZNAME = cfg.get("site", "TZNAME")
+CITY_NAME = get_cfg("site", "CITY_NAME")
+LAT = get_cfg("site", "LAT", cast=float)
+LON = get_cfg("site", "LON", cast=float)
+TZNAME = get_cfg("site", "TZNAME")
+
+# Cache Astral location
+ASTRAL_LOC = LocationInfo(CITY_NAME, "USA", TZNAME, LAT, LON)
 
 # Inverters
 INVERTERS = []
-for part in cfg.get("inverters", "INVERTERS").split(","):
+for part in get_cfg("inverters", "INVERTERS", fallback="").split(","):
     part = part.strip()
     if not part:
         continue
-    name, host, port, unit = [x.strip() for x in part.split(":")]
-    INVERTERS.append({
-        "name": name,
-        "host": host,
-        "port": int(port),
-        "unit": int(unit),
-    })
+    try:
+        name, host, port, unit = [x.strip() for x in part.split(":")]
+        INVERTERS.append({
+            "name": name,
+            "host": host,
+            "port": int(port),
+            "unit": int(unit),
+        })
+    except ValueError:
+        print(f"⚠️ Invalid inverter entry: '{part}'", file=sys.stderr)
 
 # Thresholds
-MORNING_GRACE = timedelta(minutes=cfg.getfloat("thresholds", "MORNING_GRACE_MIN", fallback=20))
-EVENING_GRACE = timedelta(minutes=cfg.getfloat("thresholds", "EVENING_GRACE_MIN", fallback=10))
-ABS_MIN_WATTS = cfg.getfloat("thresholds", "ABS_MIN_WATTS", fallback=150)
-SAFE_DC_VOLT_MAX = cfg.getfloat("thresholds", "SAFE_DC_VOLT_MAX", fallback=150)
-ZERO_CURRENT_EPS = cfg.getfloat("thresholds", "ZERO_CURRENT_EPS", fallback=0.05)
+MORNING_GRACE = timedelta(minutes=get_cfg("thresholds", "MORNING_GRACE_MIN", fallback=20, cast=float))
+EVENING_GRACE = timedelta(minutes=get_cfg("thresholds", "EVENING_GRACE_MIN", fallback=10, cast=float))
+ABS_MIN_WATTS = get_cfg("thresholds", "ABS_MIN_WATTS", fallback=150, cast=float)
+SAFE_DC_VOLT_MAX = get_cfg("thresholds", "SAFE_DC_VOLT_MAX", fallback=150, cast=float)
+ZERO_CURRENT_EPS = get_cfg("thresholds", "ZERO_CURRENT_EPS", fallback=0.05, cast=float)
 PEER_COMPARE = cfg.getboolean("thresholds", "PEER_COMPARE", fallback=True)
-PEER_MIN_WATTS = cfg.getfloat("thresholds", "PEER_MIN_WATTS", fallback=600)
-PEER_LOW_RATIO = cfg.getfloat("thresholds", "PEER_LOW_RATIO", fallback=0.20)
+PEER_MIN_WATTS = get_cfg("thresholds", "PEER_MIN_WATTS", fallback=600, cast=float)
+PEER_LOW_RATIO = get_cfg("thresholds", "PEER_LOW_RATIO", fallback=0.20, cast=float)
 
 # Alert repetition
-ALERT_REPEAT_COUNT = cfg.getint("alerts", "ALERT_REPEAT_COUNT", fallback=3)
-ALERT_REPEAT_WINDOW_MIN = cfg.getint("alerts", "ALERT_REPEAT_WINDOW_MIN", fallback=30)
-ALERT_STATE_FILE = cfg.get("alerts", "ALERT_STATE_FILE", fallback="/tmp/inverter_alert_state.json")
+ALERT_REPEAT_COUNT = get_cfg("alerts", "ALERT_REPEAT_COUNT", fallback=3, cast=int)
+ALERT_REPEAT_WINDOW_MIN = get_cfg("alerts", "ALERT_REPEAT_WINDOW_MIN", fallback=30, cast=int)
+ALERT_STATE_FILE = get_cfg("alerts", "ALERT_STATE_FILE", fallback="/tmp/inverter_alert_state.json")
+
+# Healthchecks
+HEALTHCHECKS_URL = get_cfg("alerts", "HEALTHCHECKS_URL", fallback="").strip()
 
 # Pushover
-PUSHOVER_USER_KEY = cfg.get("pushover", "PUSHOVER_USER_KEY", fallback=None)
-PUSHOVER_API_TOKEN = cfg.get("pushover", "PUSHOVER_API_TOKEN", fallback=None)
+PUSHOVER_USER_KEY = get_cfg("pushover", "PUSHOVER_USER_KEY", fallback=None)
+PUSHOVER_API_TOKEN = get_cfg("pushover", "PUSHOVER_API_TOKEN", fallback=None)
 
 # SolarEdge Cloud API
 ENABLE_SOLAREDGE_API = cfg.getboolean("solaredge_api", "ENABLE_SOLAREDGE_API", fallback=False)
-SOLAREDGE_API_KEY = cfg.get("solaredge_api", "SOLAREDGE_API_KEY", fallback=None)
-SOLAREDGE_SITE_ID = cfg.get("solaredge_api", "SOLAREDGE_SITE_ID", fallback=None)
+SOLAREDGE_API_KEY = get_cfg("solaredge_api", "SOLAREDGE_API_KEY", fallback=None)
+SOLAREDGE_SITE_ID = get_cfg("solaredge_api", "SOLAREDGE_SITE_ID", fallback=None)
 
 
 # ---------------- UTILITIES ----------------
@@ -97,27 +120,21 @@ SOLAREDGE_SITE_ID = cfg.get("solaredge_api", "SOLAREDGE_SITE_ID", fallback=None)
 def pushover_notify(title: str, message: str, priority: int = 0):
     """
     Send a Pushover notification if credentials are configured.
-
-    - If BOTH PUSHOVER_USER_KEY and PUSHOVER_API_TOKEN are blank or missing → skip silently.
-    - If ONE is missing but not the other → print error and exit(1).
-    - Otherwise, send the notification.
+    - If BOTH PUSHOVER_USER_KEY and PUSHOVER_API_TOKEN are blank → skip silently.
+    - If ONE missing → raise RuntimeError (config error).
     """
     user_key = (PUSHOVER_USER_KEY or "").strip()
     api_token = (PUSHOVER_API_TOKEN or "").strip()
 
-    # Case 1: both missing/blank → feature disabled
     if not user_key and not api_token:
         if os.environ.get("DEBUG"):
             print("ℹ️  Pushover disabled (no credentials configured).", file=sys.stderr)
         return
 
-    # Case 2: one missing but not both → configuration error
     if bool(user_key) != bool(api_token):
-        print("❌ Configuration error: Both PUSHOVER_USER_KEY and PUSHOVER_API_TOKEN must be set for Pushover.", file=sys.stderr)
-        sys.exit(1)
+        raise RuntimeError("Configuration error: Both PUSHOVER_USER_KEY and PUSHOVER_API_TOKEN must be set for Pushover.")
 
-    # Case 3: both provided → proceed normally
-    data = urllib.parse.urlencode({
+    data = urlencode({
         "token": api_token,
         "user": user_key,
         "title": title,
@@ -132,35 +149,31 @@ def pushover_notify(title: str, message: str, priority: int = 0):
         print(f"⚠️ Failed to send Pushover alert: {e}", file=sys.stderr)
 
 
-
-import urllib.error
-
 def ping_healthcheck(status: str, message: str = ""):
     """
-    Ping a Healthchecks.io URL with optional status message.
-
-    - If HEALTHCHECKS_URL is unset or blank, this function does nothing.
-    - Sends an OK ping by default.
-    - Sends a /fail ping if status == "fail".
+    Ping Healthchecks.io with optional status message.
+    Disabled if HEALTHCHECKS_URL missing/blank.
     """
-    url = cfg.get("alerts", "HEALTHCHECKS_URL", fallback="").strip()
-    if not url:
+    if not HEALTHCHECKS_URL:
         if os.environ.get("DEBUG"):
             print("ℹ️  Healthchecks disabled (no URL configured).", file=sys.stderr)
         return
 
-    full_url = url.rstrip("/")
+    url = HEALTHCHECKS_URL.rstrip("/")
     if status == "fail":
-        full_url += "/fail"
+        url += "/fail"
 
+    parsed = list(urlparse(url))
+    query = {}
     if message:
-        full_url += f"?{urllib.parse.urlencode({'msg': message[:200]})}"
+        query["msg"] = message[:200]
+    parsed[4] = urlencode(query)
+    full_url = urlunparse(parsed)
 
     try:
         urllib.request.urlopen(full_url, timeout=5)
     except urllib.error.URLError as e:
         print(f"⚠️ Failed to ping Healthchecks.io: {e}", file=sys.stderr)
-
 
 
 def now_local():
@@ -169,8 +182,7 @@ def now_local():
 
 def solar_window(dt_local):
     """Return (is_daylight, sunrise, sunset) with grace windows."""
-    loc = LocationInfo(CITY_NAME, "USA", TZNAME, LAT, LON)
-    s = sun(loc.observer, date=dt_local.date(), tzinfo=dt_local.tzinfo)
+    s = sun(ASTRAL_LOC.observer, date=dt_local.date(), tzinfo=dt_local.tzinfo)
     sunrise = s["sunrise"] + MORNING_GRACE
     sunset = s["sunset"] - EVENING_GRACE
     return (sunrise <= dt_local <= sunset, sunrise, sunset)
@@ -208,13 +220,10 @@ def read_inverter(inv, verbose=False):
     try:
         socket.gethostbyname(inv["host"])
         inverter = solaredge_modbus.Inverter(
-            host=inv["host"],
-            port=inv["port"],
-            timeout=2,
-            unit=inv["unit"],
+            host=inv["host"], port=inv["port"], timeout=2, unit=inv["unit"]
         )
         v = inverter.read_all()
-    except Exception as e:
+    except (socket.error, OSError, Exception) as e:
         if verbose:
             print(f"[{inv['name']}] ERROR reading inverter: {e}", file=sys.stderr)
         return {"id": inv["name"], "error": True}
@@ -241,12 +250,18 @@ def read_inverter(inv, verbose=False):
 
 # ---------------- ALERT REPETITION CONTROL ----------------
 
+_ALERT_STATE_CACHE = None
+
 def load_alert_state():
+    global _ALERT_STATE_CACHE
+    if _ALERT_STATE_CACHE is not None:
+        return _ALERT_STATE_CACHE
     try:
         with open(ALERT_STATE_FILE, "r") as f:
-            return json.load(f)
+            _ALERT_STATE_CACHE = json.load(f)
     except Exception:
-        return {}
+        _ALERT_STATE_CACHE = {}
+    return _ALERT_STATE_CACHE
 
 
 def save_alert_state(state):
@@ -270,49 +285,89 @@ def should_alert(key):
     return record["count"] >= ALERT_REPEAT_COUNT
 
 
-# ---------------- DETECTION ----------------
-# (unchanged from prior version)
+# ---------------- SIMULATION CONSTANTS ----------------
 
-# ---------------- MAIN ----------------
+SIMULATED_NORMAL = {"status": 4, "pac_W": 5000.0, "vdc_V": 380.0, "idc_A": 13.0}
+
+
+# ---------------- CLI ARGUMENTS ----------------
 
 def build_arg_parser(inverter_names):
     choices_str = ", ".join(inverter_names) if inverter_names else "none available"
+
+    examples = """\
+Examples:
+  Normal run (verbose):
+    python3 monitor_inverters.py --verbose
+
+  Output raw JSON for one run:
+    python3 monitor_inverters.py --json
+
+  Simulate issues:
+    python3 monitor_inverters.py --simulate low --simulate-target SE7600H
+
+  Cron-friendly (quiet, pings Healthchecks):
+    */5 * * * * /usr/bin/python3 /opt/solaredge/monitor_inverters.py --quiet
+"""
+
+    exit_codes = """\
+Exit Codes:
+  0  All OK or alert suppressed (within repeat window)
+  1  No inverter responded (communication failure)
+  2  Confirmed alert triggered (notification sent)
+"""
+
     ap = argparse.ArgumentParser(
-        description="Monitor SolarEdge inverters via Modbus + optional Cloud API.\n"
-                    "Sends alerts only after repeated detections (X over Y).",
+        description=(
+            "Monitor SolarEdge inverters via Modbus + optional Cloud API.\n"
+            "Sends alerts only after repeated detections (X over Y).\n\n"
+            f"(Available inverters: {choices_str})"
+        ),
         formatter_class=RawTextHelpFormatter,
-        epilog=f"(Available inverters: {choices_str})"
+        epilog=f"{exit_codes}\n{examples}"
     )
+
     ap.add_argument("--json", action="store_true", help="print full inverter readings as JSON and exit")
     ap.add_argument("--verbose", action="store_true", help="emit detailed logs during checks")
+    ap.add_argument("--quiet", action="store_true", help="suppress non-error output (cron-friendly)")
     ap.add_argument("--simulate", choices=["off", "low", "fault", "offline"], default="off",
                     help="simulate a failure mode on an inverter (default: off)")
     ap.add_argument("--simulate-target", metavar="NAME", choices=inverter_names,
                     help=f"apply simulation to inverter (choices: {choices_str})")
     ap.add_argument("--test-pushover", action="store_true",
                     help="send a test notification to verify Pushover configuration")
+
     return ap
 
+
+
+# ---------------- MAIN ----------------
 
 def main():
     inverter_names = [inv["name"] for inv in INVERTERS]
     ap = build_arg_parser(inverter_names)
     args = ap.parse_args()
 
+    def log(msg, err=False):
+        if err:
+            print(msg, file=sys.stderr)
+        elif not args.quiet:
+            print(msg)
+
     # --- Pushover test mode ---
     if args.test_pushover:
-        print("🔔 Sending test notification via Pushover...")
+        log("🔔 Sending test notification via Pushover...")
         msg = f"Test message from SolarEdge inverter monitor\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         pushover_notify("SolarEdge Monitor Test", msg, priority=0)
-        print("✅ Test notification sent (check your device).")
+        log("✅ Test notification sent (check your device).")
         return 0
 
     dt_local = now_local()
     is_day, sunrise, sunset = solar_window(dt_local)
 
-    if args.verbose:
-        print(f"[time] now={dt_local.strftime('%Y-%m-%d %H:%M:%S %Z')} day={is_day} "
-              f"sunrise+grace={sunrise.strftime('%H:%M')} sunset-grace={sunset.strftime('%H:%M')}")
+    if args.verbose and not args.quiet:
+        log(f"[time] now={dt_local.strftime('%Y-%m-%d %H:%M:%S %Z')} day={is_day} "
+            f"sunrise+grace={sunrise.strftime('%H:%M')} sunset-grace={sunset.strftime('%H:%M')}")
 
     results, any_success = [], False
     for inv in INVERTERS:
@@ -320,9 +375,9 @@ def main():
         results.append(r)
         if not r.get("error"):
             any_success = True
-            if args.verbose:
-                print(f"[{r['id']}] PAC={r['pac_W']:.0f}W Vdc={r['vdc_V']:.1f}V "
-                      f"Idc={r['idc_A']:.2f}A status={status_text(r['status'])}")
+            if args.verbose and not args.quiet:
+                log(f"[{r['id']}] PAC={r['pac_W']:.0f}W Vdc={r['vdc_V']:.1f}V "
+                    f"Idc={r['idc_A']:.2f}A status={status_text(r['status'])}")
 
     simulation_info = None
 
@@ -337,43 +392,39 @@ def main():
                     target = r
                     break
             if target is None:
-                print(f"⚠️  No inverter found with name '{args.simulate_target}', using first inverter instead.")
+                log(f"⚠️ No inverter found with name '{args.simulate_target}', using first inverter instead.")
                 target = results[0]
         else:
-            # Default to smallest model number
+            # Default: lowest kW model
             def extract_kw(inv):
-                model = inv.get("model", "") or inv["name"]
                 import re
+                model = inv.get("model", "") or inv["name"]
                 m = re.search(r"(\d{4,5})", model)
                 return int(m.group(1)) if m else 99999
             target = min(results, key=extract_kw)
 
-        print(f"🔧 Simulating inverter '{target['name']}' in mode '{args.simulate}'")
+        log(f"🔧 Simulating inverter '{target['name']}' in mode '{args.simulate}'")
         simulation_info = f"{args.simulate} on {target['name']}"
 
-        # All other inverters simulate normal
+        # All others simulate normal
         for r in results:
             if r is target:
                 continue
             if not r.get("error"):
-                r["status"] = 4
-                r["pac_W"] = 5000.0
-                r["vdc_V"] = 380.0
-                r["idc_A"] = 13.0
+                r.update(SIMULATED_NORMAL)
                 if args.verbose:
-                    print(f"(Simulation) {r['id']} simulating normal output")
+                    log(f"(Simulation) {r['id']} simulating normal output")
 
         # Target inverter behavior
         if args.simulate == "low":
-            target["pac_W"] = 0.0
-            target["status"] = 4
-            print(f"(Simulation) {target['id']} simulating 0W output")
+            target.update({"pac_W": 0.0, "status": 4})
+            log(f"(Simulation) {target['id']} simulating 0W output")
         elif args.simulate == "fault":
             target["status"] = 7
-            print(f"(Simulation) {target['id']} simulating FAULT state")
+            log(f"(Simulation) {target['id']} simulating FAULT state")
         elif args.simulate == "offline":
             target["error"] = True
-            print(f"(Simulation) {target['id']} simulating unreachable state")
+            log(f"(Simulation) {target['id']} simulating unreachable state")
 
     # --- JSON output ---
     if args.json:
@@ -383,20 +434,20 @@ def main():
         print(json.dumps(out, indent=2, default=str))
         return 0
 
-    # ... (rest of main unchanged: anomaly detection, alerts, API checks)
-
-
     if not any_success:
-        print("ERROR: no inverter responded", file=sys.stderr)
+        log("ERROR: no inverter responded", err=True)
         ping_healthcheck("fail", message="No inverter responded")
         return 1
 
     all_sleeping = all(r.get("status") == 2 for r in results if not r.get("error"))
     if all_sleeping or not is_day:
-        if args.verbose:
+        if args.verbose and not args.quiet:
             reason = "all Sleeping" if all_sleeping else "Astral night"
-            print(f"Night window ({reason}): skipping checks.")
+            log(f"Night window ({reason}): skipping checks.")
         return 0
+
+    # ---------------- DETECTION + CLOUD CHECKS ----------------
+    from detect import detect_anomalies, check_solaredge_api  # ensure these exist
 
     read_ok = [r for r in results if not r.get("error")]
     alerts = detect_anomalies(read_ok)
@@ -405,12 +456,11 @@ def main():
         if r.get("error"):
             alerts.append(f"{r['id']}: Modbus read failed")
 
-    # --- Cloud API checks ---
     cloud_alerts = check_solaredge_api()
     if cloud_alerts:
-        print("Cloud API Alerts:")
+        log("Cloud API Alerts:")
         for a in cloud_alerts:
-            print("  -", a)
+            log("  - " + a)
         alerts.extend(cloud_alerts)
 
     if alerts:
@@ -421,19 +471,23 @@ def main():
                 confirmed.append(msg)
         if confirmed:
             msg = "\n".join(confirmed)
-            print(f"ALERT:\n{msg}")
+            log(f"ALERT:\n{msg}")
             pushover_notify("SolarEdge Monitor Alert", msg, priority=1)
             ping_healthcheck("fail", message=confirmed[0])
             return 2
         else:
-            # Suppressed (not repeated enough within the window)
             return 0
 
-    if args.verbose:
-        print("OK: all inverters normal.")
+    log("OK: all inverters normal.")
     ping_healthcheck("ok", message="All normal")
     return 0
 
 
+# ---------------- ENTRY POINT ----------------
+
+# Exit codes:
+#   0 = OK or suppressed alert
+#   1 = No inverter responded
+#   2 = Confirmed alert triggered
 if __name__ == "__main__":
     sys.exit(main())

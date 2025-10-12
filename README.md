@@ -11,6 +11,8 @@ It’s daylight-aware, supports repeated-detection suppression, and can send **P
 - [Configuration](#configuration)
 - [Testing Modbus connectivity](#testing-modbus-connectivity)
 - [Running the Monitor](#running-the-monitor)
+- [Full Usage](#full-usage)
+  - [Exit Codes](#exit-codes)
 - [Simulation Examples](#simulation-examples)
 - [Files](#files)
 - [Troubleshooting](#troubleshooting)
@@ -146,6 +148,33 @@ Cron mode (silent, only alerts):
 Output detailed JSON:
 
 `python3 monitor_inverters.py --json`
+
+## Full Usage
+
+The monitor_inverters.py script supports several command-line options to control behavior, logging, simulation, and testing.
+
+| Option	| Arguments	| Description |
+| ------  | --------- | ----------- |
+|-h, --help| N/A |	Show built-in help text, including exit codes and examples.|
+| --json	| N/A	|Output full inverter readings (raw JSON), then exit. Useful for debugging, data collection, or integration with other tools.|
+| --verbose	| N/A |	Show detailed logs for every inverter (PAC, VDC, IDC, status, etc.). Recommended when running interactively.|
+| --quiet	| N/A |	Suppress all non-error output. Ideal for cron or systemd timers. Errors and alerts still appear on stderr. |
+| --simulate	|{off, low, fault, offline}| Simulate inverter behavior without hardware impact.
+| | | low → PAC=0 W while still “Producing” |
+| | | fault → Reports inverter in FAULT state |
+| | | offline → Pretend inverter unreachable |
+| | | off → Normal operation (default) |
+| --simulate-target	| NAME | Select which inverter to apply simulation to (default: smallest model inverter). All other inverters simulate normal output. |
+| --test-pushover	| N/A |	Send a test Pushover notification to verify credentials and network reachability. |
+| --quiet	| N/A |	Suppress informational logs, useful for cron or unattended operation.|
+| --help	| N/A |	Display this help and exit.|
+
+## Exit Codes
+| Code | Meaning |
+| ---- | ------- |
+| 0	| All OK or alert suppressed (below repeat threshold). |
+| 1	| No inverter responded — communication or connection failure.|
+| 2	| Confirmed alert triggered — notification sent.|
 
 ### Simulation & Testing
 
