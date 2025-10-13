@@ -31,6 +31,7 @@ from datetime import datetime, timedelta
 import argparse
 from argparse import RawTextHelpFormatter
 from urllib.parse import urlparse, urlunparse, urlencode
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 # ---------------- CONFIG LOADING ----------------
@@ -377,14 +378,25 @@ def main():
             f"sunrise+grace={sunrise.strftime('%H:%M')} sunset-grace={sunset.strftime('%H:%M')}")
 
     results, any_success = [], False
-    for inv in INVERTERS:
-        r = read_inverter(inv, verbose=args.verbose)
-        results.append(r)
-        if not r.get("error"):
-            any_success = True
-            if args.verbose and not args.quiet:
-                log(f"[{r['id']}] PAC={r['pac_W']:.0f}W Vdc={r['vdc_V']:.1f}V "
-                    f"Idc={r['idc_A']:.2f}A status={status_text(r['status'])}")
+
+    # Threaded Modbus reads
+    with ThreadPoolExecutor(max_workers=min(8, len(INVERTERS) or 1)) as executor:
+        futures = {executor.submit(read_inverter, inv, args.verbose): inv for inv in INVERTERS}
+
+        for future in as_completed(futures):
+            inv = futures[future]
+            try:
+                r = future.result()
+            except Exception as e:
+                r = {"id": inv["name"], "error": True}
+                print(f"[{inv['name']}] Threaded read exception: {e}", file=sys.stderr)
+            results.append(r)
+            if not r.get("error"):
+                any_success = True
+                if args.verbose and not args.quiet:
+                    log(f"[{r['id']}] PAC={r['pac_W']:.0f}W Vdc={r['vdc_V']:.1f}V "
+                        f"Idc={r['idc_A']:.2f}A status={status_text(r['status'])}")
+
 
     simulation_info = None
 
