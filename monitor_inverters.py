@@ -96,6 +96,8 @@ ZERO_CURRENT_EPS = get_cfg("thresholds", "ZERO_CURRENT_EPS", fallback=0.05, cast
 PEER_COMPARE = cfg.getboolean("thresholds", "PEER_COMPARE", fallback=True)
 PEER_MIN_WATTS = get_cfg("thresholds", "PEER_MIN_WATTS", fallback=600, cast=float)
 PEER_LOW_RATIO = get_cfg("thresholds", "PEER_LOW_RATIO", fallback=0.20, cast=float)
+MODBUS_TIMEOUT = get_cfg("thresholds", "MODBUS_TIMEOUT", fallback=1.0, cast=float)
+MODBUS_RETRIES = get_cfg("thresholds", "MODBUS_RETRIES", fallback=3, cast=int)
 
 # Alert repetition
 ALERT_REPEAT_COUNT = get_cfg("alerts", "ALERT_REPEAT_COUNT", fallback=3, cast=int)
@@ -220,8 +222,13 @@ def read_inverter(inv, verbose=False):
     try:
         socket.gethostbyname(inv["host"])
         inverter = solaredge_modbus.Inverter(
-            host=inv["host"], port=inv["port"], timeout=2, unit=inv["unit"]
+            host=inv["host"],
+            port=inv["port"],
+            timeout=MODBUS_TIMEOUT,
+            retries=MODBUS_RETRIES,
+            unit=inv["unit"],
         )
+
         v = inverter.read_all()
     except (socket.error, OSError, Exception) as e:
         if verbose:
