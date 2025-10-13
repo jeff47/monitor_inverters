@@ -356,6 +356,12 @@ def main():
     ap = build_arg_parser(inverter_names)
     args = ap.parse_args()
 
+    # --- Verbose module info ---
+    if args.verbose and not args.quiet:
+        print(f"solaredge_modbus version: {getattr(solaredge_modbus, '__version__', '(unknown)')}")
+        print(f"Loaded from: {getattr(solaredge_modbus, '__file__', '(unknown path)')}")
+
+
     def log(msg, err=False):
         if err:
             print(msg, file=sys.stderr)
@@ -465,8 +471,84 @@ def main():
             log(f"Night window ({reason}): skipping checks.")
         return 0
 
-    # ---------------- DETECTION + CLOUD CHECKS ----------------
-    from detect import detect_anomalies, check_solaredge_api  # ensure these exist
+    # ---------------- DETECTION ----------------
+
+    def detect_anomalies(results):
+        """Return list of alert strings based on status and power rules."""
+        alerts = []
+        for r in results:
+            st, st_txt = r["status"], status_text(r["status"])
+            pac, vdc, idc = r["pac_W"], r["vdc_V"], r["idc_A"]
+
+            if st not in (2, 4):
+                alerts.append(f"{r['id']}: Abnormal status ({st_txt})")
+
+            if vdc is not None and idc is not None:
+                if abs(idc) <= ZERO_CURRENT_EPS and vdc < SAFE_DC_VOLT_MAX:
+                    alerts.append(
+                        f"{r['id']}: SafeDC/open-DC suspected "
+                        f"(Vdc={vdc:.1f}V, Idc≈0A, status={st_txt})"
+                    )
+
+            if pac is not None and pac < ABS_MIN_WATTS and st == 4:
+                alerts.append(
+                    f"{r['id']}: Low production "
+                    f"(PAC={pac:.0f}W < {ABS_MIN_WATTS:.0f}W, status={st_txt})"
+                )
+
+        if PEER_COMPARE and len(results) >= 2:
+            pacs = [r["pac_W"] for r in results if r["pac_W"] is not None]
+            if pacs and max(pacs) >= PEER_MIN_WATTS:
+                med = sorted(pacs)[len(pacs) // 2]
+                threshold = max(med * PEER_LOW_RATIO, ABS_MIN_WATTS)
+                for r in results:
+                    pac = r["pac_W"]
+                    if pac is None:
+                        continue
+                    if pac < threshold:
+                        alerts.append(
+                            f"{r['id']}: Under peer median "
+                            f"(PAC={pac:.0f}W < {threshold:.0f}W, peers median≈{med:.0f}W)"
+                        )
+
+        # Merge duplicate keys for cleaner output
+        merged = {}
+        for msg in alerts:
+            key = msg.split(":")[0]
+            merged.setdefault(key, []).append(msg)
+        out = []
+        for k, msgs in merged.items():
+            if len(msgs) == 1:
+                out.append(msgs[0])
+            else:
+                out.append(f"{k}: " + " | ".join(m.split(": ", 1)[1] for m in msgs))
+        return out
+
+
+    # ---------------- SOLAREDGE API CHECK ----------------
+
+    def check_solaredge_api():
+        """Check inverter and optimizer reporting via SolarEdge cloud API."""
+        if not ENABLE_SOLAREDGE_API:
+            return []
+
+        if not SOLAREDGE_API_KEY or not SOLAREDGE_SITE_ID:
+            return ["SolarEdge API not configured (missing SOLAREDGE_SITE_ID or SOLAREDGE_API_KEY)"]
+
+        base_url = "https://monitoringapi.solaredge.com"
+        alerts = []
+        now = dt.datetime.now(dt.timezone.utc)
+        start = (now - dt.timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+        end = now.strftime("%Y-%m-%d %H:%M:%S")
+
+        # Optionally extend with API requests here in the future
+        # Example (disabled):
+        # url = f"{base_url}/site/{SOLAREDGE_SITE_ID}/inverters?api_key={SOLAREDGE_API_KEY}"
+        # resp = requests.get(url, timeout=10)
+        # if resp.status_code != 200:
+        #     alerts.append(f"SolarEdge API error: {resp.status_code}")
+        return alerts
+
 
     read_ok = [r for r in results if not r.get("error")]
     alerts = detect_anomalies(read_ok)
