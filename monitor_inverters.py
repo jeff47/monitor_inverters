@@ -22,7 +22,7 @@ import urllib.parse
 import urllib.error
 import pytz
 import configparser
-import solaredge_modbus
+#import solaredge_modbus
 from astral import LocationInfo
 from astral.sun import sun
 import requests
@@ -33,6 +33,20 @@ from argparse import RawTextHelpFormatter
 from urllib.parse import urlparse, urlunparse, urlencode
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# -------- Load developmental solaredge_modbus module instead of system version --------
+import importlib.util
+from pathlib import Path
+
+# Absolute path to your module
+mod_path = Path("/home/jeff/projects/personal/solaredge_modbus/src/solaredge_modbus/__init__.py")
+
+# Dynamically load only this specific module
+spec = importlib.util.spec_from_file_location("solaredge_modbus", mod_path)
+solaredge_modbus = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(solaredge_modbus)
+
+# Optionally register in sys.modules for dependent imports to see it
+sys.modules["solaredge_modbus"] = solaredge_modbus
 
 # ---------------- CONFIG LOADING ----------------
 
