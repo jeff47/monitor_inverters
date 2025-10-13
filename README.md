@@ -76,6 +76,8 @@ ZERO_CURRENT_EPS = 0.05
 PEER_COMPARE = True
 PEER_MIN_WATTS = 600
 PEER_LOW_RATIO = 0.20
+MODBUS_TIMEOUT = 0.3
+MODBUS_RETRIES = 1
 
 [alerts]
 ALERT_REPEAT_COUNT = 3
@@ -109,6 +111,8 @@ SOLAREDGE_SITE_ID = 123456
 |     | `PEER_COMPARE`            | Enable cross-inverter power comparison                 | `True` / `False`                                                  |
 |     | `PEER_MIN_WATTS`          | Minimum peer power before comparison applies           | Integer or float watts (e.g. `600`)                               |
 |     | `PEER_LOW_RATIO`          | Ratio below peer median to trigger alert               | Float between `0.0` and `1.0` (e.g. `0.2`)                        |
+| | `MODBUS_TIMEOUT` | Modbus to timeout, in seconds.  Defaults to `1.0`, try reducing to `0.3` or `0.5` for faster performance | Float(e.g. `0.3`) |
+| | `MODBUS_RETRIES` | Number of times to retry.  Defaults to `3` | Integer (e.g. `1`) |
 | **[alerts]**        | `ALERT_REPEAT_COUNT`      | Number of consecutive detections required before alert | Integer (e.g. `3`)                                                |
 |        | `ALERT_REPEAT_WINDOW_MIN` | Time window for repeated detections                    | Integer minutes (e.g. `30`)                                       |
 |         | `ALERT_STATE_FILE`        | JSON file storing persistent alert state               | Valid file path (e.g. `/tmp/inverter_alert_state.json`)           |
