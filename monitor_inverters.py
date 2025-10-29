@@ -133,6 +133,31 @@ SOLAREDGE_SITE_ID = get_cfg("solaredge_api", "SOLAREDGE_SITE_ID", fallback=None)
 
 
 # ---------------- UTILITIES ----------------
+def load_optimizer_expectations():
+    """
+    Reads [optimizers] section.
+    - TOTAL_EXPECTED (int): optional
+    - Other keys are inverter serial numbers with expected optimizer counts.
+    """
+    total_expected = None
+    per_inv_expected = {}
+
+    if cfg.has_section("optimizers"):
+        for key, val in cfg.items("optimizers"):
+            key = key.strip().upper()
+            try:
+                count = int(str(val).strip())
+            except Exception:
+                continue
+            if key == "TOTAL_EXPECTED":
+                total_expected = count
+            else:
+                # Always treat as serial number
+                per_inv_expected[key] = count
+
+    return total_expected, per_inv_expected
+
+
 
 def pushover_notify(title: str, message: str, priority: int = 0):
     """
@@ -479,11 +504,16 @@ def main():
         return 1
 
     all_sleeping = all(r.get("status") == 2 for r in results if not r.get("error"))
-    if all_sleeping or not is_day:
-        if args.verbose and not args.quiet:
-            reason = "all Sleeping" if all_sleeping else "Astral night"
-            log(f"Night window ({reason}): skipping checks.")
-        return 0
+
+    # Skip only Modbus-based production checks at night,
+    # but still allow SolarEdge API health/fault checks.
+    if not ENABLE_SOLAREDGE_API:
+        if all_sleeping or not is_day:
+            if args.verbose and not args.quiet:
+                reason = "all Sleeping" if all_sleeping else "Astral night"
+                log(f"Night window ({reason}): skipping checks.")
+            return 0
+
 
     # ---------------- DETECTION ----------------
 
@@ -494,8 +524,14 @@ def main():
             st, st_txt = r["status"], status_text(r["status"])
             pac, vdc, idc = r["pac_W"], r["vdc_V"], r["idc_A"]
 
+            # Skip production/safety checks at night
+            if not is_day:
+                continue
+
             if st not in (2, 4):
                 alerts.append(f"{r['id']}: Abnormal status ({st_txt})")
+
+
 
             if vdc is not None and idc is not None:
                 if abs(idc) <= ZERO_CURRENT_EPS and vdc < SAFE_DC_VOLT_MAX:
@@ -542,26 +578,133 @@ def main():
     # ---------------- SOLAREDGE API CHECK ----------------
 
     def check_solaredge_api():
-        """Check inverter and optimizer reporting via SolarEdge cloud API."""
+        """Check inverter health/faults and optimizer connectivity via SolarEdge Cloud API."""
         if not ENABLE_SOLAREDGE_API:
             return []
-
         if not SOLAREDGE_API_KEY or not SOLAREDGE_SITE_ID:
             return ["SolarEdge API not configured (missing SOLAREDGE_SITE_ID or SOLAREDGE_API_KEY)"]
 
         base_url = "https://monitoringapi.solaredge.com"
         alerts = []
-        now = dt.datetime.now(dt.timezone.utc)
-        start = (now - dt.timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
-        end = now.strftime("%Y-%m-%d %H:%M:%S")
+        session = requests.Session()
+        total_expected, expected_by_serial = load_optimizer_expectations()
 
-        # Optionally extend with API requests here in the future
-        # Example (disabled):
-        # url = f"{base_url}/site/{SOLAREDGE_SITE_ID}/inverters?api_key={SOLAREDGE_API_KEY}"
-        # resp = requests.get(url, timeout=10)
-        # if resp.status_code != 200:
-        #     alerts.append(f"SolarEdge API error: {resp.status_code}")
+        # --- (A) Fetch inverter list ---
+        try:
+            eq_url = f"{base_url}/equipment/{SOLAREDGE_SITE_ID}/list?api_key={SOLAREDGE_API_KEY}"
+            resp = session.get(eq_url, timeout=15)
+            resp.raise_for_status()
+            eq_list = resp.json().get("reporters", {}).get("list", [])
+        except Exception as e:
+            return [f"SolarEdge API equipment list error: {e}"]
+
+        # Map serial → human name for output clarity
+        serial_to_name = {e.get("serialNumber"): e.get("name", e.get("serialNumber")) for e in eq_list}
+
+        # --- (B) Check inverter telemetry for FAULT / OFF / 0W-with-DC ---
+        now = dt.datetime.now()
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = now
+        dt_local = now_local()
+        is_day, _, _ = solar_window(dt_local)
+
+        for e in eq_list:
+            serial = e.get("serialNumber")
+            name = serial_to_name.get(serial, serial)
+            if not serial:
+                continue
+            try:
+                params = {
+                    "startTime": start.strftime("%Y-%m-%d %H:%M:%S"),
+                    "endTime":   end.strftime("%Y-%m-%d %H:%M:%S"),
+                    "api_key":   SOLAREDGE_API_KEY,
+                }
+                r = session.get(f"{base_url}/equipment/{SOLAREDGE_SITE_ID}/{serial}/data",
+                                params=params, timeout=20)
+
+                if r.status_code != 200:
+                    alerts.append(f"{name}: API returned {r.status_code} for inverter data")
+                    continue
+
+                tele = r.json().get("data", {}).get("telemetries", [])
+                if not tele:
+                    alerts.append(f"{name}: no telemetry data received today")
+                    continue
+
+                # --- Scan all telemetry for faults during the day ---
+                # Some systems report a brief FAULT then recover, so we look across all samples.
+
+                fault_modes = []
+                zero_output_intervals = []
+
+                for t in tele:
+                    mode = t.get("inverterMode")
+                    pac = t.get("totalActivePower", 0.0)
+                    vdc = t.get("dcVoltage")
+                    if mode in ("FAULT", "OFF"):
+                        fault_modes.append(t)
+                    elif is_day and pac == 0 and (vdc is None or vdc > 50):
+                        zero_output_intervals.append(t)
+
+                if fault_modes:
+                    first_fault = fault_modes[0]["date"]
+                    last_fault = fault_modes[-1]["date"]
+                    alerts.append(f"{name}: inverterMode=FAULT/OFF observed {first_fault} → {last_fault}")
+                elif zero_output_intervals:
+                    first_zero = zero_output_intervals[0]["date"]
+                    alerts.append(f"{name}: 0 W output with DC present (since {first_zero})")
+
+            except Exception as ex:
+                alerts.append(f"{name}: failed to read inverter data ({ex})")
+
+        # --- (C) Optimizer connectivity via /inventory ---
+        try:
+            inv_url = f"{base_url}/site/{SOLAREDGE_SITE_ID}/inventory?api_key={SOLAREDGE_API_KEY}"
+            inv_resp = session.get(inv_url, timeout=15)
+            inv_resp.raise_for_status()
+            inv_json = inv_resp.json()
+        except Exception as e:
+            alerts.append(f"Inventory read error: {e}")
+            return alerts
+
+        inverters = inv_json.get("Inventory", {}).get("inverters", []) or []
+        per_serial_counts = {}
+        total_connected = 0
+
+        for inv in inverters:
+            serial = (
+                inv.get("serialNumber")
+                or inv.get("sn")
+                or inv.get("SN")
+                or inv.get("serial")
+                or inv.get("SerialNumber")
+         )
+            count = inv.get("connectedOptimizers", 0)
+            try:
+                count = int(count)
+            except Exception:
+                count = 0
+            per_serial_counts[str(serial).upper()] = count
+            total_connected += count
+
+        # (C1) Check total
+        if isinstance(total_expected, int) and total_connected < total_expected:
+            alerts.append(
+                f"Optimizers: {total_connected} connected < expected {total_expected} (total)"
+            )
+
+        # (C2) Check per-inverter expectations by serial
+        for serial, expected in expected_by_serial.items():
+            actual = per_serial_counts.get(serial.upper())
+            name = serial_to_name.get(serial, serial)
+            if actual is None:
+                alerts.append(f"{name}: optimizer count unavailable (serial {serial})")
+            elif actual < expected:
+                alerts.append(f"{name}: {actual} optimizers < expected {expected}")
+
         return alerts
+
+
 
 
     read_ok = [r for r in results if not r.get("error")]
