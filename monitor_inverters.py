@@ -331,6 +331,29 @@ def should_alert(key):
     save_alert_state(state)
     return record["count"] >= ALERT_REPEAT_COUNT
 
+# ---------------- RECOVERY TRACKING ----------------
+def update_inverter_states(results):
+    """Track inverter mode transitions and issue recovery notifications."""
+    state = load_alert_state()
+    recoveries = []
+
+    for r in results:
+        name = r.get("name") or r.get("id")
+        st_txt = status_text(r.get("status", 0))
+        last_mode = state.get(name, {}).get("last_mode")
+
+        # Detect a recovery transition (Fault/Off → Producing)
+        if last_mode in ("Fault", "Off") and st_txt == "Producing":
+            msg = f"{name}: recovered from {last_mode} → Producing"
+            recoveries.append(msg)
+            pushover_notify("SolarEdge Recovery", msg, priority=0)
+
+        # Always store current mode
+        state.setdefault(name, {})["last_mode"] = st_txt
+
+    save_alert_state(state)
+    return recoveries
+
 
 # ---------------- SIMULATION CONSTANTS ----------------
 
@@ -704,11 +727,13 @@ def main():
 
         return alerts
 
-
-
-
     read_ok = [r for r in results if not r.get("error")]
     alerts = detect_anomalies(read_ok)
+
+    # Track and notify recoveries ---
+    recoveries = update_inverter_states(read_ok)
+    for msg in recoveries:
+        log(f"ℹ️ {msg}")
 
     for r in results:
         if r.get("error"):
