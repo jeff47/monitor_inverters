@@ -732,7 +732,9 @@ def main():
     # ---------------- SOLAREDGE API CHECK ----------------
 
     def check_solaredge_api():
-        """Check inverter health/faults and optimizer connectivity via SolarEdge Cloud API."""
+        """Check inverter health/faults and optimizer connectivity via SolarEdge Cloud API.
+        Includes filtering for low-light and stale zero-output samples.
+        """
         if not ENABLE_SOLAREDGE_API:
             return []
         if not SOLAREDGE_API_KEY or not SOLAREDGE_SITE_ID:
@@ -752,10 +754,9 @@ def main():
         except Exception as e:
             return [f"SolarEdge API equipment list error: {e}"]
 
-        # Map serial → human name for output clarity
         serial_to_name = {e.get("serialNumber"): e.get("name", e.get("serialNumber")) for e in eq_list}
 
-        # --- (B) Check inverter telemetry for FAULT / OFF / 0W-with-DC ---
+        # --- (B) Per-inverter telemetry checks ---
         now = dt.datetime.now()
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         end = now
@@ -775,7 +776,6 @@ def main():
                 }
                 r = session.get(f"{base_url}/equipment/{SOLAREDGE_SITE_ID}/{serial}/data",
                                 params=params, timeout=20)
-
                 if r.status_code != 200:
                     alerts.append(f"{name}: API returned {r.status_code} for inverter data")
                     continue
@@ -785,9 +785,6 @@ def main():
                     alerts.append(f"{name}: no telemetry data received today")
                     continue
 
-                # --- Scan all telemetry for faults during the day ---
-                # Some systems report a brief FAULT then recover, so we look across all samples.
-
                 fault_modes = []
                 zero_output_intervals = []
 
@@ -795,11 +792,32 @@ def main():
                     mode = t.get("inverterMode")
                     pac = t.get("totalActivePower", 0.0)
                     vdc = t.get("dcVoltage")
+
                     if mode in ("FAULT", "OFF"):
                         fault_modes.append(t)
+
                     elif is_day and pac == 0 and (vdc is None or vdc > 50):
+                        # --- filter out harmless / stale zero-output readings ---
+                        from datetime import datetime, timedelta
+                        try:
+                            ts = datetime.strptime(t["date"], "%Y-%m-%d %H:%M:%S")
+                        except Exception:
+                            ts = None
+
+                        # Skip samples newer than 20 min (likely lag)
+                        if ts and (datetime.now() - ts).total_seconds() < 1200:
+                            continue
+
+                        # Cross-check against live Modbus data
+                        matching_modbus = next((m for m in results if m.get("serial") == serial), None)
+                        if matching_modbus:
+                            pac_now = matching_modbus.get("pac_W") or 0
+                            if pac_now > 100:   # producing modestly → skip false alarm
+                                continue
+
                         zero_output_intervals.append(t)
 
+                # --- Summarize any findings ---
                 if fault_modes:
                     first_fault = fault_modes[0]["date"]
                     last_fault = fault_modes[-1]["date"]
@@ -832,7 +850,7 @@ def main():
                 or inv.get("SN")
                 or inv.get("serial")
                 or inv.get("SerialNumber")
-         )
+            )
             count = inv.get("connectedOptimizers", 0)
             try:
                 count = int(count)
@@ -841,13 +859,11 @@ def main():
             per_serial_counts[str(serial).upper()] = count
             total_connected += count
 
-        # (C1) Check total
+        # (C1) total optimizer count
         if isinstance(total_expected, int) and total_connected < total_expected:
-            alerts.append(
-                f"Optimizers: {total_connected} connected < expected {total_expected} (total)"
-            )
+            alerts.append(f"Optimizers: {total_connected} connected < expected {total_expected} (total)")
 
-        # (C2) Check per-inverter expectations by serial
+        # (C2) per-inverter expectations
         for serial, expected in expected_by_serial.items():
             actual = per_serial_counts.get(serial.upper())
             name = serial_to_name.get(serial, serial)
@@ -857,6 +873,7 @@ def main():
                 alerts.append(f"{name}: {actual} optimizers < expected {expected}")
 
         return alerts
+
 
     read_ok = [r for r in results if not r.get("error")]
     alerts = detect_anomalies(read_ok)
