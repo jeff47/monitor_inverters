@@ -537,6 +537,9 @@ Exit Codes:
                     help="send a test notification to verify Pushover configuration")
     ap.add_argument("--force-summary", action="store_true",
                     help="force immediate daily summary (bypass sunset/time guard)")
+    ap.add_argument("--debug", action="store_true",
+                help="enable extra debug output (API and Modbus details)")
+
 
     return ap
 
@@ -732,8 +735,12 @@ def main():
     # ---------------- SOLAREDGE API CHECK ----------------
 
     def check_solaredge_api():
-        """Check inverter health/faults and optimizer connectivity via SolarEdge Cloud API.
-        Includes filtering for low-light and stale zero-output samples.
+        """Fetch inverter and optimizer data from the SolarEdge Cloud API.
+
+        Works with HD-Wave inverters:
+        - Queries /equipment/{site}/list for inverter serials.
+        - Fetches recent telemetry per inverter.
+        - Reads optimizer counts from /site/{site}/inventory.
         """
         if not ENABLE_SOLAREDGE_API:
             return []
@@ -741,100 +748,79 @@ def main():
             return ["SolarEdge API not configured (missing SOLAREDGE_SITE_ID or SOLAREDGE_API_KEY)"]
 
         base_url = "https://monitoringapi.solaredge.com"
-        alerts = []
         session = requests.Session()
+        alerts = []
         total_expected, expected_by_serial = load_optimizer_expectations()
 
-        # --- (A) Fetch inverter list ---
+        # --- (A) Equipment list ---
         try:
             eq_url = f"{base_url}/equipment/{SOLAREDGE_SITE_ID}/list?api_key={SOLAREDGE_API_KEY}"
             resp = session.get(eq_url, timeout=15)
             resp.raise_for_status()
             eq_list = resp.json().get("reporters", {}).get("list", [])
+            if args.debug:
+                print(f"[DEBUG] Equipment list: {len(eq_list)} devices retrieved")
         except Exception as e:
             return [f"SolarEdge API equipment list error: {e}"]
 
         serial_to_name = {e.get("serialNumber"): e.get("name", e.get("serialNumber")) for e in eq_list}
 
-        # --- (B) Per-inverter telemetry checks ---
+        # --- (B) Inverter telemetry ---
         now = dt.datetime.now()
-        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        start = now - timedelta(hours=1)
         end = now
-        dt_local = now_local()
-        is_day, _, _ = solar_window(dt_local)
 
         for e in eq_list:
             serial = e.get("serialNumber")
             name = serial_to_name.get(serial, serial)
             if not serial:
                 continue
-            try:
-                params = {
-                    "startTime": start.strftime("%Y-%m-%d %H:%M:%S"),
-                    "endTime":   end.strftime("%Y-%m-%d %H:%M:%S"),
-                    "api_key":   SOLAREDGE_API_KEY,
-                }
-                r = session.get(f"{base_url}/equipment/{SOLAREDGE_SITE_ID}/{serial}/data",
-                                params=params, timeout=20)
-                if r.status_code != 200:
-                    alerts.append(f"{name}: API returned {r.status_code} for inverter data")
-                    continue
 
+            # Strip suffixes like "-CF" for cleaner lookup
+            serial_clean = serial.split("-")[0]
+            params = {
+                "startTime": start.strftime("%Y-%m-%d %H:%M:%S"),
+                "endTime": end.strftime("%Y-%m-%d %H:%M:%S"),
+                "api_key": SOLAREDGE_API_KEY,
+            }
+            try:
+                url = f"{base_url}/equipment/{SOLAREDGE_SITE_ID}/{serial_clean}/data"
+                r = session.get(url, params=params, timeout=20)
+                r.raise_for_status()
                 tele = r.json().get("data", {}).get("telemetries", [])
                 if not tele:
-                    alerts.append(f"{name}: no telemetry data received today")
+                    alerts.append(f"{name}: no telemetry data in past hour")
+                    if args.debug:
+                        print(f"[DEBUG] {name}: no telemetry in {start:%H:%M}–{end:%H:%M}")
                     continue
 
-                fault_modes = []
-                zero_output_intervals = []
+                latest = tele[-1]
+                pac = latest.get("totalActivePower", 0.0)
+                vdc = latest.get("dcVoltage")
+                mode = latest.get("inverterMode", "UNKNOWN")
+                ts = latest.get("date")
 
-                for t in tele:
-                    mode = t.get("inverterMode")
-                    pac = t.get("totalActivePower", 0.0)
-                    vdc = t.get("dcVoltage")
+                if args.debug:
+                    print(f"[DEBUG] {name}: {pac:.1f} W, {vdc} Vdc, mode={mode}, time={ts}")
 
-                    if mode in ("FAULT", "OFF"):
-                        fault_modes.append(t)
-
-                    elif is_day and pac == 0 and (vdc is None or vdc > 50):
-                        # --- filter out harmless / stale zero-output readings ---
-                        from datetime import datetime, timedelta
-                        try:
-                            ts = datetime.strptime(t["date"], "%Y-%m-%d %H:%M:%S")
-                        except Exception:
-                            ts = None
-
-                        # Skip samples newer than 20 min (likely lag)
-                        if ts and (datetime.now() - ts).total_seconds() < 1200:
-                            continue
-
-                        # Cross-check against live Modbus data
-                        matching_modbus = next((m for m in results if m.get("serial") == serial), None)
-                        if matching_modbus:
-                            pac_now = matching_modbus.get("pac_W") or 0
-                            if pac_now > 100:   # producing modestly → skip false alarm
-                                continue
-
-                        zero_output_intervals.append(t)
-
-                # --- Summarize any findings ---
-                if fault_modes:
-                    first_fault = fault_modes[0]["date"]
-                    last_fault = fault_modes[-1]["date"]
-                    alerts.append(f"{name}: inverterMode=FAULT/OFF observed {first_fault} → {last_fault}")
-                elif zero_output_intervals:
-                    first_zero = zero_output_intervals[0]["date"]
-                    alerts.append(f"{name}: 0 W output with DC present (since {first_zero})")
+                if mode in ("FAULT", "OFF"):
+                    alerts.append(f"{name}: inverterMode={mode} (API time {ts})")
+                elif pac == 0 and vdc and vdc > 50:
+                    alerts.append(f"{name}: 0 W output with DC present (API time {ts})")
 
             except Exception as ex:
                 alerts.append(f"{name}: failed to read inverter data ({ex})")
+                if args.debug:
+                    print(f"[DEBUG] {name}: telemetry request failed → {ex}")
 
-        # --- (C) Optimizer connectivity via /inventory ---
+        # --- (C) Optimizer connectivity (from /site/.../inventory) ---
         try:
             inv_url = f"{base_url}/site/{SOLAREDGE_SITE_ID}/inventory?api_key={SOLAREDGE_API_KEY}"
             inv_resp = session.get(inv_url, timeout=15)
             inv_resp.raise_for_status()
             inv_json = inv_resp.json()
+            if args.debug:
+                print(f"[DEBUG] Inventory query OK, keys: {list(inv_json.keys())}")
         except Exception as e:
             alerts.append(f"Inventory read error: {e}")
             return alerts
@@ -844,35 +830,45 @@ def main():
         total_connected = 0
 
         for inv in inverters:
-            serial = (
-                inv.get("serialNumber")
-                or inv.get("sn")
-                or inv.get("SN")
-                or inv.get("serial")
-                or inv.get("SerialNumber")
-            )
-            count = inv.get("connectedOptimizers", 0)
+            # Handle serial field variations
+            serial_raw = inv.get("serialNumber") or inv.get("SN") or ""
+            serial_clean = serial_raw.split("-")[0]
+            name = inv.get("name", serial_clean)
+            count = inv.get("connectedOptimizers")
             try:
-                count = int(count)
+                count = int(count) if count is not None else 0
             except Exception:
                 count = 0
-            per_serial_counts[str(serial).upper()] = count
+            per_serial_counts[serial_clean.upper()] = count
             total_connected += count
+            if args.debug:
+                print(f"[DEBUG] {name} ({serial_clean}): {count} optimizers connected")
 
-        # (C1) total optimizer count
+        if args.debug:
+            print(f"[DEBUG] Total optimizers connected: {total_connected}")
+
+        # --- (D) Compare against expected counts ---
         if isinstance(total_expected, int) and total_connected < total_expected:
             alerts.append(f"Optimizers: {total_connected} connected < expected {total_expected} (total)")
 
-        # (C2) per-inverter expectations
+        # --- (E) Compare against expected counts (normalized serials) ---
         for serial, expected in expected_by_serial.items():
-            actual = per_serial_counts.get(serial.upper())
+            serial_clean = serial.split("-")[0].upper()
+            actual = per_serial_counts.get(serial_clean)
             name = serial_to_name.get(serial, serial)
             if actual is None:
-                alerts.append(f"{name}: optimizer count unavailable (serial {serial})")
+                if args.debug:
+                    print(f"[DEBUG] No optimizer data match for {serial} (normalized {serial_clean})")
+                # skip noisy "unavailable" message if total_connected > 0
+                if total_connected == 0:
+                    alerts.append(f"{name}: optimizer count unavailable (serial {serial})")
             elif actual < expected:
                 alerts.append(f"{name}: {actual} optimizers < expected {expected}")
 
+
         return alerts
+
+
 
 
     read_ok = [r for r in results if not r.get("error")]
@@ -893,6 +889,29 @@ def main():
         for a in cloud_alerts:
             log("  - " + a)
         alerts.extend(cloud_alerts)
+
+    import re
+
+    # --- Merge duplicate alerts (same inverter, normalized by serial) ---
+    unique_alerts = {}
+    serial_pattern = re.compile(r"\[([0-9A-Fa-f]{6,})\]")  # matches serials like [750B6C32]
+
+    for msg in alerts:
+        key = msg.split(":")[0].strip()
+        m = serial_pattern.search(key)
+        if m:
+            key = m.group(1).upper()  # use serial as unique key
+        else:
+            # fallback: normalize "Inverter 2" → "INVERTER 2"
+            key = key.upper()
+
+        # keep only the longest message for that inverter
+        if key not in unique_alerts or len(msg) > len(unique_alerts[key]):
+            unique_alerts[key] = msg
+
+    alerts = list(unique_alerts.values())
+
+
 
     exit_code = 0
 
