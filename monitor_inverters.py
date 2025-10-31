@@ -22,7 +22,7 @@ import urllib.parse
 import urllib.error
 import pytz
 import configparser
-#import solaredge_modbus
+# import solaredge_modbus
 from astral import LocationInfo
 from astral.sun import sun
 import requests
@@ -32,21 +32,60 @@ import argparse
 from argparse import RawTextHelpFormatter
 from urllib.parse import urlparse, urlunparse, urlencode
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import re
+from pathlib import Path
+import importlib.util
 
 # -------- Load developmental solaredge_modbus module instead of system version --------
-import importlib.util
-from pathlib import Path
-
-# Absolute path to your module
 mod_path = Path("/home/jeff/projects/personal/solaredge_modbus/src/solaredge_modbus/__init__.py")
-
-# Dynamically load only this specific module
 spec = importlib.util.spec_from_file_location("solaredge_modbus", mod_path)
 solaredge_modbus = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(solaredge_modbus)
-
-# Optionally register in sys.modules for dependent imports to see it
 sys.modules["solaredge_modbus"] = solaredge_modbus
+
+# ---------------- IDENTITY HELPERS ----------------
+
+SERIAL_RE = re.compile(r"([0-9A-Fa-f]{6,})")
+
+def clean_serial(s: str) -> str:
+    """Return uppercased serial without SolarEdge suffixes like '-CF'."""
+    if not s:
+        return ""
+    return s.split("-")[0].upper().strip()
+
+def model_base(model: str) -> str:
+    """Return model truncated at first hyphen (e.g., 'SE7600H-US000BNI4' -> 'SE7600H')."""
+    if not model:
+        return ""
+    return model.split("-", 1)[0].strip()
+
+def inv_display_from_parts(model: str, serial: str) -> str:
+    """Canonical visible identity: 'MODELBASE [SERIAL]' when both present."""
+    mb = model_base(model)
+    ser = clean_serial(serial)
+    if mb and ser:
+        return f"{mb} [{ser}]"
+    if ser:
+        return f"[{ser}]"
+    return mb or "UNKNOWN"
+
+def extract_serial_from_text(s: str) -> str:
+    """Find serial inside square brackets or anywhere in text."""
+    if not s:
+        return ""
+    m = re.search(r"\[([0-9A-Fa-f]{6,})\]", s)
+    if m:
+        return m.group(1).upper()
+    m2 = SERIAL_RE.search(s)
+    return m2.group(1).upper() if m2 else ""
+
+def key_for_alert_message(msg: str) -> str:
+    """Stable key for dedupe / repeat-suppression: prefer serial, else prefix text."""
+    ser = extract_serial_from_text(msg)
+    if ser:
+        return ser
+    # fallback to prefix before ':' normalized
+    return (msg.split(":", 1)[0].strip().upper()) if ":" in msg else msg.strip().upper()
 
 # ---------------- CONFIG LOADING ----------------
 
@@ -61,9 +100,7 @@ def load_config(path="monitor_inverters.conf"):
     parser.read(path)
     return parser
 
-
 cfg = load_config()
-
 
 def get_cfg(section, key, fallback=None, cast=None):
     """Safer config accessor with fallback and optional casting."""
@@ -74,7 +111,6 @@ def get_cfg(section, key, fallback=None, cast=None):
         return val
     except (configparser.NoSectionError, configparser.NoOptionError):
         return fallback
-
 
 # ---------------- CONFIG VALUES ----------------
 
@@ -137,7 +173,6 @@ DAILY_SUMMARY_ENABLED = cfg.getboolean("alerts", "DAILY_SUMMARY_ENABLED", fallba
 DAILY_SUMMARY_METHOD = get_cfg("alerts", "DAILY_SUMMARY_METHOD", fallback="api").strip().lower()  # "api" or "modbus"
 DAILY_SUMMARY_OFFSET_MIN = get_cfg("alerts", "DAILY_SUMMARY_OFFSET_MIN", fallback=60, cast=int)  # sunset + 60 min
 
-
 # ---------------- UTILITIES ----------------
 def load_optimizer_expectations():
     """
@@ -150,38 +185,28 @@ def load_optimizer_expectations():
 
     if cfg.has_section("optimizers"):
         for key, val in cfg.items("optimizers"):
-            key = key.strip().upper()
+            key_up = key.strip().upper()
             try:
                 count = int(str(val).strip())
             except Exception:
                 continue
-            if key == "TOTAL_EXPECTED":
+            if key_up == "TOTAL_EXPECTED":
                 total_expected = count
             else:
-                # Always treat as serial number
-                per_inv_expected[key] = count
+                per_inv_expected[clean_serial(key_up)] = count
 
     return total_expected, per_inv_expected
 
-
-
 def pushover_notify(title: str, message: str, priority: int = 0):
-    """
-    Send a Pushover notification if credentials are configured.
-    - If BOTH PUSHOVER_USER_KEY and PUSHOVER_API_TOKEN are blank → skip silently.
-    - If ONE missing → raise RuntimeError (config error).
-    """
+    """Send a Pushover notification if credentials are configured."""
     user_key = (PUSHOVER_USER_KEY or "").strip()
     api_token = (PUSHOVER_API_TOKEN or "").strip()
-
     if not user_key and not api_token:
         if os.environ.get("DEBUG"):
             print("ℹ️  Pushover disabled (no credentials configured).", file=sys.stderr)
         return
-
     if bool(user_key) != bool(api_token):
         raise RuntimeError("Configuration error: Both PUSHOVER_USER_KEY and PUSHOVER_API_TOKEN must be set for Pushover.")
-
     data = urlencode({
         "token": api_token,
         "user": user_key,
@@ -189,44 +214,34 @@ def pushover_notify(title: str, message: str, priority: int = 0):
         "message": message,
         "priority": str(priority),
     }).encode("utf-8")
-
     try:
         req = urllib.request.Request("https://api.pushover.net/1/messages.json", data=data)
         urllib.request.urlopen(req, timeout=10)
     except Exception as e:
         print(f"⚠️ Failed to send Pushover alert: {e}", file=sys.stderr)
 
-
 def ping_healthcheck(status: str, message: str = ""):
-    """
-    Ping Healthchecks.io with optional status message.
-    Disabled if HEALTHCHECKS_URL missing/blank.
-    """
+    """Ping Healthchecks.io with optional status message."""
     if not HEALTHCHECKS_URL:
         if os.environ.get("DEBUG"):
             print("ℹ️  Healthchecks disabled (no URL configured).", file=sys.stderr)
         return
-
     url = HEALTHCHECKS_URL.rstrip("/")
     if status == "fail":
         url += "/fail"
-
     parsed = list(urlparse(url))
     query = {}
     if message:
         query["msg"] = message[:200]
     parsed[4] = urlencode(query)
     full_url = urlunparse(parsed)
-
     try:
         urllib.request.urlopen(full_url, timeout=5)
     except urllib.error.URLError as e:
         print(f"⚠️ Failed to ping Healthchecks.io: {e}", file=sys.stderr)
 
-
 def now_local():
     return datetime.now(pytz.timezone(TZNAME))
-
 
 def solar_window(dt_local):
     """Return (is_daylight, sunrise, sunset) with grace windows."""
@@ -234,7 +249,6 @@ def solar_window(dt_local):
     sunrise = s["sunrise"] + MORNING_GRACE
     sunset = s["sunset"] - EVENING_GRACE
     return (sunrise <= dt_local <= sunset, sunrise, sunset)
-
 
 def scaled(values, name):
     """Return scaled numeric value (applies *_scale if present)."""
@@ -246,7 +260,6 @@ def scaled(values, name):
         return float(raw) * float(scale)
     except Exception:
         return None
-
 
 def status_text(code: int) -> str:
     """Return descriptive status name."""
@@ -262,7 +275,6 @@ def status_text(code: int) -> str:
     }
     return explicit.get(code, f"Unknown({code})")
 
-
 def read_inverter(inv, verbose=False):
     """Read key metrics from one inverter."""
     try:
@@ -274,7 +286,6 @@ def read_inverter(inv, verbose=False):
             retries=MODBUS_RETRIES,
             unit=inv["unit"],
         )
-
         v = inverter.read_all()
     except (socket.error, OSError, Exception) as e:
         if verbose:
@@ -283,13 +294,13 @@ def read_inverter(inv, verbose=False):
 
     model = v.get("c_model") or v.get("model")
     serial = v.get("c_serialnumber") or v.get("serialnumber")
-    id_str = f"{model} [{serial}]" if model and serial else model or serial or inv["name"]
+    id_str = inv_display_from_parts(model, serial)
 
     return {
-        "name": inv["name"],
-        "id": id_str,
+        "name": inv["name"],     # configured nickname
+        "id": id_str,            # canonical visible identity
         "model": model,
-        "serial": serial,
+        "serial": clean_serial(serial),
         "status": v.get("status"),
         "vendor_status": v.get("vendor_status"),
         "pac_W": scaled(v, "power_ac"),
@@ -300,7 +311,6 @@ def read_inverter(inv, verbose=False):
         "e_total_Wh": scaled(v, "energy_total") or scaled(v, "total_energy"),
         "raw": v,
     }
-
 
 # ---------------- ALERT REPETITION CONTROL ----------------
 
@@ -317,7 +327,6 @@ def load_alert_state():
         _ALERT_STATE_CACHE = {}
     return _ALERT_STATE_CACHE
 
-
 def save_alert_state(state):
     try:
         with open(ALERT_STATE_FILE, "w") as f:
@@ -325,42 +334,47 @@ def save_alert_state(state):
     except Exception as e:
         print(f"⚠️ Failed to save alert state: {e}", file=sys.stderr)
 
-
-def should_alert(key):
-    """Return True if alert for 'key' should be triggered now (after X/Y rule)."""
+def should_alert(key_text):
+    """Return True if alert for 'key_text' should be triggered now (after X/Y rule)."""
+    serial = clean_serial(key_text)
+    key = serial if serial else key_text.strip().upper()
     state = load_alert_state()
     now = time.time()
-    record = state.get(key, {"count": 0, "first": now})
-    if now - record["first"] > ALERT_REPEAT_WINDOW_MIN * 60:
-        record = {"count": 0, "first": now}
-    record["count"] += 1
+
+    record = state.get(key) or {}
+    first_ts = record.get("first", now)
+    count = record.get("count", 0)
+
+    # reset window if expired or malformed
+    if not isinstance(first_ts, (int, float)) or now - first_ts > ALERT_REPEAT_WINDOW_MIN * 60:
+        first_ts = now
+        count = 0
+
+    count += 1
+    record.update({"first": first_ts, "count": count})
     state[key] = record
     save_alert_state(state)
-    return record["count"] >= ALERT_REPEAT_COUNT
+
+    return count >= ALERT_REPEAT_COUNT
+
 
 # ---------------- RECOVERY TRACKING ----------------
 def update_inverter_states(results):
     """Track inverter mode transitions and issue recovery notifications."""
     state = load_alert_state()
     recoveries = []
-
     for r in results:
-        name = r.get("name") or r.get("id")
+        key_display = inv_display_from_parts(r.get("model"), r.get("serial"))
+        key_state = clean_serial(r.get("serial")) or key_display.upper()
         st_txt = status_text(r.get("status", 0))
-        last_mode = state.get(name, {}).get("last_mode")
-
-        # Detect a recovery transition (Fault/Off → Producing)
+        last_mode = state.get(key_state, {}).get("last_mode")
         if last_mode in ("Fault", "Off") and st_txt == "Producing":
-            msg = f"{name}: recovered from {last_mode} → Producing"
+            msg = f"{key_display}: recovered from {last_mode} → Producing"
             recoveries.append(msg)
             pushover_notify("SolarEdge Recovery", msg, priority=0)
-
-        # Always store current mode
-        state.setdefault(name, {})["last_mode"] = st_txt
-
+        state.setdefault(key_state, {})["last_mode"] = st_txt
     save_alert_state(state)
     return recoveries
-
 
 # ---------------- DAILY SUMMARY ----------------
 def _fetch_site_daily_kwh_api():
@@ -368,11 +382,9 @@ def _fetch_site_daily_kwh_api():
     if not (ENABLE_SOLAREDGE_API and SOLAREDGE_API_KEY and SOLAREDGE_SITE_ID):
         print("🔍 [DEBUG] API disabled or missing key/site id.")
         return None
-
     base = "https://monitoringapi.solaredge.com"
     session = requests.Session()
     today = datetime.now().strftime("%Y-%m-%d")
-
     params = {
         "timeUnit": "DAY",
         "startDate": today,
@@ -380,120 +392,88 @@ def _fetch_site_daily_kwh_api():
         "api_key": SOLAREDGE_API_KEY,
     }
     url = f"{base}/site/{SOLAREDGE_SITE_ID}/energy"
-
     try:
         r = session.get(url, params=params, timeout=20)
-
         if r.status_code != 200:
             print("⚠️ [DEBUG] Non-200 from API; aborting site energy fetch.")
             return None
-
         j = r.json()
-
         energy = j.get("energy", {})
         values = energy.get("values", [])
-
         if not values:
             return None
-
         first = values[0]
         total_Wh = first.get("value")
-
         if total_Wh is None:
             return None
-
         total_kWh = round(float(total_Wh) / 1000.0, 2)
-
         return {"site_total": total_kWh}
-
     except Exception as e:
         print(f"⚠️ [DEBUG] Exception in _fetch_site_daily_kwh_api: {e}", file=sys.stderr)
         return None
-
 
 def _compute_per_inverter_daily_kwh_modbus(results):
     """Compute per-inverter kWh for today from lifetime Wh deltas."""
     state = load_alert_state()
     date_str = now_local().strftime("%Y-%m-%d")
     totals = {}
-
     for r in results:
-        name = r.get("name") or r.get("id")
+        key_display = inv_display_from_parts(r.get("model"), r.get("serial"))
+        key_state = f"{clean_serial(r.get('serial')) or key_display.upper()}:{date_str}"
         e_total_Wh = r.get("e_total_Wh")
         if e_total_Wh is None:
             continue
-
         energy_state = state.setdefault("energy", {})
-        key = f"{name}:{date_str}"
-        baseline = energy_state.get(key)
+        baseline = energy_state.get(key_state)
         if baseline is None:
-            energy_state[key] = e_total_Wh
+            energy_state[key_state] = e_total_Wh
             delta_Wh = 0.0
         else:
             delta_Wh = max(0.0, e_total_Wh - float(baseline))
-
-        totals[name] = round(delta_Wh / 1000.0, 2)
-
+        totals[key_display] = round(delta_Wh / 1000.0, 2)
     save_alert_state(state)
     return totals
-
 
 def maybe_send_daily_summary(results):
     """Send once-per-day summary at (sunset + DAILY_SUMMARY_OFFSET_MIN) or immediately if forced."""
     if not DAILY_SUMMARY_ENABLED:
         return
-
     dt_local = now_local()
     date_str = dt_local.strftime("%Y-%m-%d")
     state = load_alert_state()
     last = state.get("daily_summary", {})
-
-    # Handle forced mode
     forced = "--force-summary" in sys.argv
-
     if not forced:
         if last.get("date") == date_str and last.get("sent"):
             return
-
         _, _, sunset = solar_window(dt_local)
         trigger_time = sunset + timedelta(minutes=DAILY_SUMMARY_OFFSET_MIN)
         if dt_local < trigger_time:
             return
-
     per_inv = None
     if DAILY_SUMMARY_METHOD == "api":
         per_inv = _fetch_site_daily_kwh_api()
-
     if per_inv is None:
         print("🔍 [DEBUG] API fetch failed or empty; trying Modbus fallback.")
         per_inv = _compute_per_inverter_daily_kwh_modbus(results)
-
     if not per_inv:
         print("⚠️ [DEBUG] No daily summary data found; aborting.")
         return
-
     total = round(sum(v for v in per_inv.values()), 2)
     lines = [f"{n}: {v:.2f} kWh" for n, v in sorted(per_inv.items())]
     lines.append(f"Total: {total:.2f} kWh")
     msg = "\n".join(lines)
-
     print(msg)
-
     pushover_notify(f"SolarEdge Daily Summary — {date_str}", msg, priority=0)
-
     state["daily_summary"] = {"date": date_str, "sent": True}
     save_alert_state(state)
 
 # ---------------- SIMULATION CONSTANTS ----------------
-
 SIMULATED_NORMAL = {"status": 4, "pac_W": 5000.0, "vdc_V": 380.0, "idc_A": 13.0}
 
-
 # ---------------- CLI ARGUMENTS ----------------
-
 def build_arg_parser(inverter_names):
     choices_str = ", ".join(inverter_names) if inverter_names else "none available"
-
     examples = """\
 Examples:
   Normal run (verbose):
@@ -508,14 +488,12 @@ Examples:
   Cron-friendly (quiet, pings Healthchecks):
     */5 * * * * /usr/bin/python3 /opt/solaredge/monitor_inverters.py --quiet
 """
-
     exit_codes = """\
 Exit Codes:
   0  All OK or alert suppressed (within repeat window)
   1  No inverter responded (communication failure)
   2  Confirmed alert triggered (notification sent)
 """
-
     ap = argparse.ArgumentParser(
         description=(
             "Monitor SolarEdge inverters via Modbus + optional Cloud API.\n"
@@ -525,7 +503,6 @@ Exit Codes:
         formatter_class=RawTextHelpFormatter,
         epilog=f"{exit_codes}\n{examples}"
     )
-
     ap.add_argument("--json", action="store_true", help="print full inverter readings as JSON and exit")
     ap.add_argument("--verbose", action="store_true", help="emit detailed logs during checks")
     ap.add_argument("--quiet", action="store_true", help="suppress non-error output (cron-friendly)")
@@ -539,14 +516,9 @@ Exit Codes:
                     help="force immediate daily summary (bypass sunset/time guard)")
     ap.add_argument("--debug", action="store_true",
                 help="enable extra debug output (API and Modbus details)")
-
-
     return ap
 
-
-
 # ---------------- MAIN ----------------
-
 def main():
     inverter_names = [inv["name"] for inv in INVERTERS]
     ap = build_arg_parser(inverter_names)
@@ -556,7 +528,6 @@ def main():
     if args.verbose and not args.quiet:
         print(f"solaredge_modbus version: {getattr(solaredge_modbus, '__version__', '(unknown)')}")
         print(f"Loaded from: {getattr(solaredge_modbus, '__file__', '(unknown path)')}")
-
 
     def log(msg, err=False):
         if err:
@@ -584,7 +555,6 @@ def main():
     # Threaded Modbus reads
     with ThreadPoolExecutor(max_workers=min(8, len(INVERTERS) or 1)) as executor:
         futures = {executor.submit(read_inverter, inv, args.verbose): inv for inv in INVERTERS}
-
         for future in as_completed(futures):
             inv = futures[future]
             try:
@@ -600,13 +570,10 @@ def main():
                         f"Idc={r['idc_A']:.2f}A status={status_text(r['status'])}")
 
 
-    simulation_info = None
-
     # --- Simulation injection ---
+    simulation_info = None
     if args.simulate != "off" and results:
         target = None
-
-        # User-specified target
         if args.simulate_target:
             for r in results:
                 if r["name"] == args.simulate_target:
@@ -627,7 +594,6 @@ def main():
         log(f"🔧 Simulating inverter '{target['name']}' in mode '{args.simulate}'")
         simulation_info = f"{args.simulate} on {target['name']}"
 
-        # All others simulate normal
         for r in results:
             if r is target:
                 continue
@@ -636,7 +602,6 @@ def main():
                 if args.verbose:
                     log(f"(Simulation) {r['id']} simulating normal output")
 
-        # Target inverter behavior
         if args.simulate == "low":
             target.update({"pac_W": 0.0, "status": 4})
             log(f"(Simulation) {target['id']} simulating 0W output")
@@ -671,9 +636,7 @@ def main():
                 log(f"Night window ({reason}): skipping checks.")
             return 0
 
-
     # ---------------- DETECTION ----------------
-
     def detect_anomalies(results):
         """Return list of alert strings based on status and power rules."""
         alerts = []
@@ -687,8 +650,6 @@ def main():
 
             if st not in (2, 4):
                 alerts.append(f"{r['id']}: Abnormal status ({st_txt})")
-
-
 
             if vdc is not None and idc is not None:
                 if abs(idc) <= ZERO_CURRENT_EPS and vdc < SAFE_DC_VOLT_MAX:
@@ -718,30 +679,22 @@ def main():
                             f"(PAC={pac:.0f}W < {threshold:.0f}W, peers median≈{med:.0f}W)"
                         )
 
-        # Merge duplicate keys for cleaner output
+        # Merge duplicate keys for cleaner output (within Modbus-generated alerts)
         merged = {}
         for msg in alerts:
-            key = msg.split(":")[0]
+            key = extract_serial_from_text(msg) or msg.split(":", 1)[0].strip().upper()
             merged.setdefault(key, []).append(msg)
         out = []
         for k, msgs in merged.items():
             if len(msgs) == 1:
                 out.append(msgs[0])
             else:
-                out.append(f"{k}: " + " | ".join(m.split(": ", 1)[1] for m in msgs))
+                out.append(f"{msgs[0].split(':',1)[0]}: " + " | ".join(m.split(": ", 1)[1] for m in msgs))
         return out
 
-
     # ---------------- SOLAREDGE API CHECK ----------------
-
-    def check_solaredge_api():
-        """Fetch inverter and optimizer data from the SolarEdge Cloud API.
-
-        Works with HD-Wave inverters:
-        - Queries /equipment/{site}/list for inverter serials.
-        - Fetches recent telemetry per inverter.
-        - Reads optimizer counts from /site/{site}/inventory.
-        """
+    def check_solaredge_api(modbus_results):
+        """Fetch inverter and optimizer data from the SolarEdge Cloud API."""
         if not ENABLE_SOLAREDGE_API:
             return []
         if not SOLAREDGE_API_KEY or not SOLAREDGE_SITE_ID:
@@ -751,6 +704,11 @@ def main():
         session = requests.Session()
         alerts = []
         total_expected, expected_by_serial = load_optimizer_expectations()
+
+        # Build Modbus serial→modelbase map for consistent display in API alerts
+        serial_to_modelbase = {}
+        for r in (m for m in modbus_results if not m.get("error")):
+            serial_to_modelbase[clean_serial(r.get("serial"))] = model_base(r.get("model"))
 
         # --- (A) Equipment list ---
         try:
@@ -763,35 +721,32 @@ def main():
         except Exception as e:
             return [f"SolarEdge API equipment list error: {e}"]
 
-        serial_to_name = {e.get("serialNumber"): e.get("name", e.get("serialNumber")) for e in eq_list}
-
         # --- (B) Inverter telemetry ---
         now = dt.datetime.now()
         start = now - timedelta(hours=1)
         end = now
 
         for e in eq_list:
-            serial = e.get("serialNumber")
-            name = serial_to_name.get(serial, serial)
+            serial = clean_serial(e.get("serialNumber"))
             if not serial:
                 continue
+            mb = serial_to_modelbase.get(serial, "")  # prefer Modbus model base
+            display = inv_display_from_parts(mb, serial)
 
-            # Strip suffixes like "-CF" for cleaner lookup
-            serial_clean = serial.split("-")[0]
             params = {
                 "startTime": start.strftime("%Y-%m-%d %H:%M:%S"),
                 "endTime": end.strftime("%Y-%m-%d %H:%M:%S"),
                 "api_key": SOLAREDGE_API_KEY,
             }
             try:
-                url = f"{base_url}/equipment/{SOLAREDGE_SITE_ID}/{serial_clean}/data"
+                url = f"{base_url}/equipment/{SOLAREDGE_SITE_ID}/{serial}/data"
                 r = session.get(url, params=params, timeout=20)
                 r.raise_for_status()
                 tele = r.json().get("data", {}).get("telemetries", [])
                 if not tele:
-                    alerts.append(f"{name}: no telemetry data in past hour")
+                    alerts.append(f"{display}: no telemetry data in past hour")
                     if args.debug:
-                        print(f"[DEBUG] {name}: no telemetry in {start:%H:%M}–{end:%H:%M}")
+                        print(f"[DEBUG] {display}: no telemetry in {start:%H:%M}–{end:%H:%M}")
                     continue
 
                 latest = tele[-1]
@@ -801,17 +756,17 @@ def main():
                 ts = latest.get("date")
 
                 if args.debug:
-                    print(f"[DEBUG] {name}: {pac:.1f} W, {vdc} Vdc, mode={mode}, time={ts}")
+                    print(f"[DEBUG] {display}: {pac:.1f} W, {vdc} Vdc, mode={mode}, time={ts}")
 
                 if mode in ("FAULT", "OFF"):
-                    alerts.append(f"{name}: inverterMode={mode} (API time {ts})")
+                    alerts.append(f"{display}: inverterMode={mode} (API time {ts})")
                 elif pac == 0 and vdc and vdc > 50:
-                    alerts.append(f"{name}: 0 W output with DC present (API time {ts})")
+                    alerts.append(f"{display}: 0 W output with DC present (API time {ts})")
 
             except Exception as ex:
-                alerts.append(f"{name}: failed to read inverter data ({ex})")
+                alerts.append(f"{display}: failed to read inverter data ({ex})")
                 if args.debug:
-                    print(f"[DEBUG] {name}: telemetry request failed → {ex}")
+                    print(f"[DEBUG] {display}: telemetry request failed → {ex}")
 
         # --- (C) Optimizer connectivity (from /site/.../inventory) ---
         try:
@@ -830,19 +785,19 @@ def main():
         total_connected = 0
 
         for inv in inverters:
-            # Handle serial field variations
             serial_raw = inv.get("serialNumber") or inv.get("SN") or ""
-            serial_clean = serial_raw.split("-")[0]
-            name = inv.get("name", serial_clean)
+            serial = clean_serial(serial_raw)
+            mb = serial_to_modelbase.get(serial, "")
+            display = inv_display_from_parts(mb, serial)
             count = inv.get("connectedOptimizers")
             try:
                 count = int(count) if count is not None else 0
             except Exception:
                 count = 0
-            per_serial_counts[serial_clean.upper()] = count
+            per_serial_counts[serial] = count
             total_connected += count
             if args.debug:
-                print(f"[DEBUG] {name} ({serial_clean}): {count} optimizers connected")
+                print(f"[DEBUG] {display}: {count} optimizers connected")
 
         if args.debug:
             print(f"[DEBUG] Total optimizers connected: {total_connected}")
@@ -851,25 +806,20 @@ def main():
         if isinstance(total_expected, int) and total_connected < total_expected:
             alerts.append(f"Optimizers: {total_connected} connected < expected {total_expected} (total)")
 
-        # --- (E) Compare against expected counts (normalized serials) ---
-        for serial, expected in expected_by_serial.items():
-            serial_clean = serial.split("-")[0].upper()
-            actual = per_serial_counts.get(serial_clean)
-            name = serial_to_name.get(serial, serial)
+        # --- (E) Compare against expected counts per inverter (normalized serials) ---
+        for exp_serial, expected in expected_by_serial.items():
+            s = clean_serial(exp_serial)
+            actual = per_serial_counts.get(s)
+            display = inv_display_from_parts(serial_to_modelbase.get(s, ""), s)
             if actual is None:
                 if args.debug:
-                    print(f"[DEBUG] No optimizer data match for {serial} (normalized {serial_clean})")
-                # skip noisy "unavailable" message if total_connected > 0
+                    print(f"[DEBUG] No optimizer data match for expected serial {s}")
                 if total_connected == 0:
-                    alerts.append(f"{name}: optimizer count unavailable (serial {serial})")
+                    alerts.append(f"{display}: optimizer count unavailable")
             elif actual < expected:
-                alerts.append(f"{name}: {actual} optimizers < expected {expected}")
-
+                alerts.append(f"{display}: {actual} optimizers < expected {expected}")
 
         return alerts
-
-
-
 
     read_ok = [r for r in results if not r.get("error")]
     alerts = detect_anomalies(read_ok)
@@ -881,45 +831,33 @@ def main():
 
     for r in results:
         if r.get("error"):
-            alerts.append(f"{r['id']}: Modbus read failed")
+            # Use canonical display even for errors
+            display = inv_display_from_parts(r.get("model"), r.get("serial"))
+            alerts.append(f"{display}: Modbus read failed")
 
-    cloud_alerts = check_solaredge_api()
+    # Cloud API checks
+    cloud_alerts = check_solaredge_api(read_ok)
     if cloud_alerts:
         log("Cloud API Alerts:")
         for a in cloud_alerts:
             log("  - " + a)
         alerts.extend(cloud_alerts)
 
-    import re
-
-    # --- Merge duplicate alerts (same inverter, normalized by serial) ---
+    # --- Merge duplicate alerts (same inverter, by serial) ---
     unique_alerts = {}
-    serial_pattern = re.compile(r"\[([0-9A-Fa-f]{6,})\]")  # matches serials like [750B6C32]
-
     for msg in alerts:
-        key = msg.split(":")[0].strip()
-        m = serial_pattern.search(key)
-        if m:
-            key = m.group(1).upper()  # use serial as unique key
-        else:
-            # fallback: normalize "Inverter 2" → "INVERTER 2"
-            key = key.upper()
-
-        # keep only the longest message for that inverter
-        if key not in unique_alerts or len(msg) > len(unique_alerts[key]):
-            unique_alerts[key] = msg
-
+        k = key_for_alert_message(msg)  # serial if present; else normalized prefix
+        if k not in unique_alerts or len(msg) > len(unique_alerts[k]):
+            unique_alerts[k] = msg
     alerts = list(unique_alerts.values())
 
-
-
+    # --- Apply repeat-suppression AFTER merge ---
     exit_code = 0
-
     if alerts:
         confirmed = []
         for msg in alerts:
-            key = msg.split(":")[0]
-            if should_alert(key):
+            k = key_for_alert_message(msg)
+            if should_alert(k):
                 confirmed.append(msg)
         if confirmed:
             msg = "\n".join(confirmed)
@@ -942,7 +880,6 @@ def main():
         log(f"⚠️ Failed to compute/send daily summary: {e}", err=True)
 
     return exit_code
-
 
 # ---------------- ENTRY POINT ----------------
 #   0 = OK or suppressed alert
