@@ -1,33 +1,62 @@
+# monitor_inverters.conf — Example Configuration
+# --------------------------------------------------------------
+# This file defines site, inverter, alert, and API settings for
+# the SolarEdge monitor_inverters.py script.
+#
+# Lines starting with "#" are comments.
+# All values are in key=value form.
+# --------------------------------------------------------------
+
 [site]
-CITY_NAME = Washington, DC
-LAT = 38.8977
-LON = -77.0365
-TZNAME = America/New_York
+# Geographic information for Astral sunrise/sunset and timezone logic.
+CITY_NAME = YourCity, YourState
+LAT = 00.0000              # Site latitude (decimal degrees)
+LON = -00.0000             # Site longitude (decimal degrees)
+TZNAME = Your/Timezone     # IANA timezone string (e.g. America/New_York)
 
 [inverters]
-# Comma-separated list in "name:ip:port:unit" format
-INVERTERS = SE10000H:192.168.1.50:1502:1, SE7600H:192.168.1.51:1502:1
+# Comma-separated list of inverters to poll via Modbus TCP.
+# Format: name:ip:port:unit
+# Example below shows two inverters on different IPs.
+INVERTERS = SE10000H:192.168.1.10:1502:1, SE7600H:192.168.1.11:1502:1
 
 [thresholds]
-MORNING_GRACE_MIN = 20
-EVENING_GRACE_MIN = 10
-ABS_MIN_WATTS = 150
-SAFE_DC_VOLT_MAX = 150
-ZERO_CURRENT_EPS = 0.05
-PEER_COMPARE = True
-PEER_MIN_WATTS = 600
-PEER_LOW_RATIO = 0.20
+# Detection thresholds and operational tuning.
+MORNING_GRACE_MIN = 20     # Ignore low output for X min after sunrise
+EVENING_GRACE_MIN = 10     # Ignore low output for X min before sunset
+ABS_MIN_WATTS = 150         # Minimum power considered “producing”
+SAFE_DC_VOLT_MAX = 150      # Voltage limit for SafeDC detection
+ZERO_CURRENT_EPS = 0.05     # Small current threshold for “zero current”
+PEER_COMPARE = True          # Compare inverters to each other for imbalance alerts
+PEER_MIN_WATTS = 600         # Minimum total output before peer compare active
+PEER_LOW_RATIO = 0.20        # Ratio threshold for low-output alert
+MODBUS_TIMEOUT = 0.3         # Timeout per Modbus query (seconds)
+MODBUS_RETRIES = 1           # Retry count per Modbus query
 
 [alerts]
-ALERT_REPEAT_COUNT = 3
-ALERT_REPEAT_WINDOW_MIN = 30
-ALERT_STATE_FILE = /tmp/inverter_alert_state.json
+# Alerting behavior and summary reporting.
+ALERT_REPEAT_COUNT = 3           # Minimum detections before alert triggers
+ALERT_REPEAT_WINDOW_MIN = 30     # Time window for repeated detections (min)
+ALERT_STATE_FILE = /tmp/inverter_alert_state.json  # Tracks alert history
+HEALTHCHECKS_URL = https://hc-ping.com/XXXXXXXXXXXX/solaredge  # Optional ping target
+DAILY_SUMMARY_ENABLED = 1        # Enable daily kWh summary message
+DAILY_SUMMARY_METHOD = api       # “api” uses SolarEdge Cloud, “modbus” uses local data
+DAILY_SUMMARY_OFFSET_MIN = 60    # Minutes after sunset to send daily summary
+
+[optimizers]
+# Expected optimizer counts — helps detect missing/failed optimizers.
+TOTAL_EXPECTED = 45              # Total expected optimizers (across all inverters)
+# Expected count per inverter by serial suffix (optional):
+740BXXXX-CF = 19
+750BXXXX-1E = 26
 
 [pushover]
-PUSHOVER_USER_KEY = XXXX
-PUSHOVER_API_TOKEN = YYYY
+# Optional Pushover notification credentials.
+PUSHOVER_USER_KEY = <redacted_user_key>
+PUSHOVER_API_TOKEN = <redacted_app_token>
 
 [solaredge_api]
+# Optional SolarEdge Cloud API integration.
 ENABLE_SOLAREDGE_API = True
-SOLAREDGE_API_KEY = ZZZZZ
-SOLAREDGE_SITE_ID = 123456
+SOLAREDGE_API_KEY = <redacted_api_key>     # Obtain from monitoring.solaredge.com
+SOLAREDGE_SITE_ID = 0000000                # Your SolarEdge site ID
