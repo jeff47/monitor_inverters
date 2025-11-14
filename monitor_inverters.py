@@ -15,7 +15,7 @@ SolarEdge inverter monitor via Modbus TCP + optional Cloud API
 import os
 import sys
 import json
-import socket
+#import socket
 import time
 import urllib.request
 import urllib.parse
@@ -32,7 +32,7 @@ import argparse
 from argparse import RawTextHelpFormatter
 from urllib.parse import urlparse, urlunparse, urlencode
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import re
+#import re
 from pathlib import Path
 import importlib.util
 
@@ -603,18 +603,19 @@ def main():
 
     all_sleeping = all(r.get("status") == 2 for r in results if not r.get("error"))
 
-    # Skip only Modbus-based production checks at night,
-    # but still allow SolarEdge API health/fault checks.
-    if not ENABLE_SOLAREDGE_API:
-        if all_sleeping or not is_day:
-            if args.verbose and not args.quiet:
-                reason = "all Sleeping" if all_sleeping else "Astral night"
-                log(f"Night window ({reason}): skipping checks.")
-            return 0
-
+    # Skip Modbus production checks at night only
+    if all_sleeping or not is_day:
+        if args.verbose and not args.quiet:
+            reason = "all Sleeping" if all_sleeping else "Astral night"
+            log(f"Night window ({reason}): skipping Modbus anomaly checks.")
+        # But still allow cloud API checks below
 
     read_ok = [r for r in results if not r.get("error")]
     alerts = detector.detect(read_ok, is_day=is_day)
+
+    # Cloud API alerts (Stage 4.3: moved to centralized checker)
+    cloud_alerts = api_checker.check(read_ok)
+    alerts.extend(cloud_alerts)
 
     # Track and notify recoveries ---
     recoveries = update_inverter_states(read_ok)
@@ -626,14 +627,6 @@ def main():
             # Use canonical display even for errors
             display = inv_display_from_parts(r.get("model"), r.get("serial"))
             alerts.append(f"{display}: Modbus read failed")
-
-    cloud_alerts = api_checker.check(read_ok)
-
-    if cloud_alerts:
-        log("Cloud API Alerts:")
-        for a in cloud_alerts:
-            log("  - " + a)
-        alerts.extend(cloud_alerts)
 
     # --- Merge duplicate alerts (same inverter, by serial) ---
     unique_alerts = {}
