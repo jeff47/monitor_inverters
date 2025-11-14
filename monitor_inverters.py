@@ -518,6 +518,8 @@ Exit Codes:
                     help="force immediate daily summary (bypass sunset/time guard)")
     ap.add_argument("--debug", action="store_true",
                 help="enable extra debug output (API and Modbus details)")
+    ap.add_argument("--config", "-c", metavar="PATH",
+                help="path to monitor_inverters.conf (overrides default)")
     return ap
 
 # ---------------- MAIN ----------------
@@ -525,6 +527,12 @@ def main():
     inverter_names = [inv["name"] for inv in INVERTERS]
     ap = build_arg_parser(inverter_names)
     args = ap.parse_args()
+
+    # Load config file (default or CLI override)
+    config_path = args.config or "monitor_inverters.conf"
+    global cfg
+    cfg = load_config(config_path)
+
 
     # --- Verbose module info ---
     if args.verbose and not args.quiet:
