@@ -35,8 +35,18 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
 from pathlib import Path
 import importlib.util
+
+# Custom classes
 from config import ConfigManager
 from inverter_reader import InverterReader, ReaderSettings
+from anomaly_detector import AnomalyDetector, DetectionSettings
+
+from utils import (
+    clean_serial,
+    model_base,
+    inv_display_from_parts,
+    extract_serial_from_text,
+)
 
 
 # -------- Load developmental solaredge_modbus module instead of system version --------
@@ -48,39 +58,39 @@ sys.modules["solaredge_modbus"] = solaredge_modbus
 
 # ---------------- IDENTITY HELPERS ----------------
 
-SERIAL_RE = re.compile(r"([0-9A-Fa-f]{6,})")
+# SERIAL_RE = re.compile(r"([0-9A-Fa-f]{6,})")
 
-def clean_serial(s: str) -> str:
-    """Return uppercased serial without SolarEdge suffixes like '-CF'."""
-    if not s:
-        return ""
-    return s.split("-")[0].upper().strip()
+# def clean_serial(s: str) -> str:
+#     """Return uppercased serial without SolarEdge suffixes like '-CF'."""
+#     if not s:
+#         return ""
+#     return s.split("-")[0].upper().strip()
 
-def model_base(model: str) -> str:
-    """Return model truncated at first hyphen (e.g., 'SE7600H-US000BNI4' -> 'SE7600H')."""
-    if not model:
-        return ""
-    return model.split("-", 1)[0].strip()
+# def model_base(model: str) -> str:
+#     """Return model truncated at first hyphen (e.g., 'SE7600H-US000BNI4' -> 'SE7600H')."""
+#     if not model:
+#         return ""
+#     return model.split("-", 1)[0].strip()
 
-def inv_display_from_parts(model: str, serial: str) -> str:
-    """Canonical visible identity: 'MODELBASE [SERIAL]' when both present."""
-    mb = model_base(model)
-    ser = clean_serial(serial)
-    if mb and ser:
-        return f"{mb} [{ser}]"
-    if ser:
-        return f"[{ser}]"
-    return mb or "UNKNOWN"
+# def inv_display_from_parts(model: str, serial: str) -> str:
+#     """Canonical visible identity: 'MODELBASE [SERIAL]' when both present."""
+#     mb = model_base(model)
+#     ser = clean_serial(serial)
+#     if mb and ser:
+#         return f"{mb} [{ser}]"
+#     if ser:
+#         return f"[{ser}]"
+#     return mb or "UNKNOWN"
 
-def extract_serial_from_text(s: str) -> str:
-    """Find serial inside square brackets or anywhere in text."""
-    if not s:
-        return ""
-    m = re.search(r"\[([0-9A-Fa-f]{6,})\]", s)
-    if m:
-        return m.group(1).upper()
-    m2 = SERIAL_RE.search(s)
-    return m2.group(1).upper() if m2 else ""
+# def extract_serial_from_text(s: str) -> str:
+#     """Find serial inside square brackets or anywhere in text."""
+#     if not s:
+#         return ""
+#     m = re.search(r"\[([0-9A-Fa-f]{6,})\]", s)
+#     if m:
+#         return m.group(1).upper()
+#     m2 = SERIAL_RE.search(s)
+#     return m2.group(1).upper() if m2 else ""
 
 def key_for_alert_message(msg: str) -> str:
     """Stable key for dedupe / repeat-suppression: prefer serial, else prefix text."""
@@ -507,6 +517,19 @@ def main():
     MODBUS_TIMEOUT = cfg.thresholds.modbus_timeout
     MODBUS_RETRIES = cfg.thresholds.modbus_retries
 
+    # Detection engine (Stage 3)
+    detector = AnomalyDetector(
+        DetectionSettings(
+            abs_min_watts=ABS_MIN_WATTS,
+            safe_dc_volt_max=SAFE_DC_VOLT_MAX,
+            zero_current_eps=ZERO_CURRENT_EPS,
+            peer_compare=PEER_COMPARE,
+            peer_min_watts=PEER_MIN_WATTS,
+            peer_low_ratio=PEER_LOW_RATIO,
+        ),
+        status_formatter=status_text,
+    )
+
     # Alerts
     ALERT_REPEAT_COUNT = cfg.alerts.repeat_count
     ALERT_REPEAT_WINDOW_MIN = cfg.alerts.repeat_window_min
@@ -673,60 +696,60 @@ def main():
             return 0
 
     # ---------------- DETECTION ----------------
-    def detect_anomalies(results):
-        """Return list of alert strings based on status and power rules."""
-        alerts = []
-        for r in results:
-            st, st_txt = r["status"], status_text(r["status"])
-            pac, vdc, idc = r["pac_W"], r["vdc_V"], r["idc_A"]
+    # def detect_anomalies(results):
+    #     """Return list of alert strings based on status and power rules."""
+    #     alerts = []
+    #     for r in results:
+    #         st, st_txt = r["status"], status_text(r["status"])
+    #         pac, vdc, idc = r["pac_W"], r["vdc_V"], r["idc_A"]
 
-            # Skip production/safety checks at night
-            if not is_day:
-                continue
+    #         # Skip production/safety checks at night
+    #         if not is_day:
+    #             continue
 
-            if st not in (2, 4):
-                alerts.append(f"{r['id']}: Abnormal status ({st_txt})")
+    #         if st not in (2, 4):
+    #             alerts.append(f"{r['id']}: Abnormal status ({st_txt})")
 
-            if vdc is not None and idc is not None:
-                if abs(idc) <= ZERO_CURRENT_EPS and vdc < SAFE_DC_VOLT_MAX:
-                    alerts.append(
-                        f"{r['id']}: SafeDC/open-DC suspected "
-                        f"(Vdc={vdc:.1f}V, Idc≈0A, status={st_txt})"
-                    )
+    #         if vdc is not None and idc is not None:
+    #             if abs(idc) <= ZERO_CURRENT_EPS and vdc < SAFE_DC_VOLT_MAX:
+    #                 alerts.append(
+    #                     f"{r['id']}: SafeDC/open-DC suspected "
+    #                     f"(Vdc={vdc:.1f}V, Idc≈0A, status={st_txt})"
+    #                 )
 
-            if pac is not None and pac < ABS_MIN_WATTS and st == 4:
-                alerts.append(
-                    f"{r['id']}: Low production "
-                    f"(PAC={pac:.0f}W < {ABS_MIN_WATTS:.0f}W, status={st_txt})"
-                )
+    #         if pac is not None and pac < ABS_MIN_WATTS and st == 4:
+    #             alerts.append(
+    #                 f"{r['id']}: Low production "
+    #                 f"(PAC={pac:.0f}W < {ABS_MIN_WATTS:.0f}W, status={st_txt})"
+    #             )
 
-        if PEER_COMPARE and len(results) >= 2:
-            pacs = [r["pac_W"] for r in results if r["pac_W"] is not None]
-            if pacs and max(pacs) >= PEER_MIN_WATTS:
-                med = sorted(pacs)[len(pacs) // 2]
-                threshold = max(med * PEER_LOW_RATIO, ABS_MIN_WATTS)
-                for r in results:
-                    pac = r["pac_W"]
-                    if pac is None:
-                        continue
-                    if pac < threshold:
-                        alerts.append(
-                            f"{r['id']}: Under peer median "
-                            f"(PAC={pac:.0f}W < {threshold:.0f}W, peers median≈{med:.0f}W)"
-                        )
+    #     if PEER_COMPARE and len(results) >= 2:
+    #         pacs = [r["pac_W"] for r in results if r["pac_W"] is not None]
+    #         if pacs and max(pacs) >= PEER_MIN_WATTS:
+    #             med = sorted(pacs)[len(pacs) // 2]
+    #             threshold = max(med * PEER_LOW_RATIO, ABS_MIN_WATTS)
+    #             for r in results:
+    #                 pac = r["pac_W"]
+    #                 if pac is None:
+    #                     continue
+    #                 if pac < threshold:
+    #                     alerts.append(
+    #                         f"{r['id']}: Under peer median "
+    #                         f"(PAC={pac:.0f}W < {threshold:.0f}W, peers median≈{med:.0f}W)"
+    #                     )
 
-        # Merge duplicate keys for cleaner output (within Modbus-generated alerts)
-        merged = {}
-        for msg in alerts:
-            key = extract_serial_from_text(msg) or msg.split(":", 1)[0].strip().upper()
-            merged.setdefault(key, []).append(msg)
-        out = []
-        for k, msgs in merged.items():
-            if len(msgs) == 1:
-                out.append(msgs[0])
-            else:
-                out.append(f"{msgs[0].split(':',1)[0]}: " + " | ".join(m.split(": ", 1)[1] for m in msgs))
-        return out
+    #     # Merge duplicate keys for cleaner output (within Modbus-generated alerts)
+    #     merged = {}
+    #     for msg in alerts:
+    #         key = extract_serial_from_text(msg) or msg.split(":", 1)[0].strip().upper()
+    #         merged.setdefault(key, []).append(msg)
+    #     out = []
+    #     for k, msgs in merged.items():
+    #         if len(msgs) == 1:
+    #             out.append(msgs[0])
+    #         else:
+    #             out.append(f"{msgs[0].split(':',1)[0]}: " + " | ".join(m.split(": ", 1)[1] for m in msgs))
+    #     return out
 
     # ---------------- SOLAREDGE API CHECK ----------------
     def check_solaredge_api(modbus_results):
@@ -859,7 +882,8 @@ def main():
 
 
     read_ok = [r for r in results if not r.get("error")]
-    alerts = detect_anomalies(read_ok)
+    alerts = detector.detect(read_ok, is_day=is_day)
+
 
     # Track and notify recoveries ---
     recoveries = update_inverter_states(read_ok)
