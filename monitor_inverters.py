@@ -43,6 +43,26 @@ solaredge_modbus = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(solaredge_modbus)
 sys.modules["solaredge_modbus"] = solaredge_modbus
 
+# Filled dynamically inside main()
+cfg = None
+CITY_NAME = LAT = LON = TZNAME = None
+ASTRAL_LOC = None
+INVERTERS = []
+MORNING_GRACE = EVENING_GRACE = None
+ABS_MIN_WATTS = SAFE_DC_VOLT_MAX = ZERO_CURRENT_EPS = None
+PEER_COMPARE = PEER_MIN_WATTS = PEER_LOW_RATIO = None
+MODBUS_TIMEOUT = MODBUS_RETRIES = None
+ALERT_REPEAT_COUNT = ALERT_REPEAT_WINDOW_MIN = None
+ALERT_STATE_FILE = None
+HEALTHCHECKS_URL = None
+PUSHOVER_USER_KEY = PUSHOVER_API_TOKEN = None
+ENABLE_SOLAREDGE_API = None
+SOLAREDGE_API_KEY = SOLAREDGE_SITE_ID = None
+DAILY_SUMMARY_ENABLED = None
+DAILY_SUMMARY_METHOD = None
+DAILY_SUMMARY_OFFSET_MIN = None
+
+
 # ---------------- IDENTITY HELPERS ----------------
 
 SERIAL_RE = re.compile(r"([0-9A-Fa-f]{6,})")
@@ -91,7 +111,6 @@ def key_for_alert_message(msg: str) -> str:
 
 def load_config(path="monitor_inverters.conf"):
     """Read configuration from INI file using configparser."""
-    parser = configparser.ConfigParser()
     parser = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
     parser.optionxform = str  # preserve case
     if not os.path.exists(path):
@@ -99,79 +118,6 @@ def load_config(path="monitor_inverters.conf"):
         sys.exit(1)
     parser.read(path)
     return parser
-
-cfg = load_config()
-
-def get_cfg(section, key, fallback=None, cast=None):
-    """Safer config accessor with fallback and optional casting."""
-    try:
-        val = cfg.get(section, key, fallback=fallback)
-        if cast and val is not None:
-            return cast(val)
-        return val
-    except (configparser.NoSectionError, configparser.NoOptionError):
-        return fallback
-
-# ---------------- CONFIG VALUES ----------------
-
-CITY_NAME = get_cfg("site", "CITY_NAME")
-LAT = get_cfg("site", "LAT", cast=float)
-LON = get_cfg("site", "LON", cast=float)
-TZNAME = get_cfg("site", "TZNAME")
-
-# Cache Astral location
-ASTRAL_LOC = LocationInfo(CITY_NAME, "USA", TZNAME, LAT, LON)
-
-# Inverters
-INVERTERS = []
-for part in get_cfg("inverters", "INVERTERS", fallback="").split(","):
-    part = part.strip()
-    if not part:
-        continue
-    try:
-        name, host, port, unit = [x.strip() for x in part.split(":")]
-        INVERTERS.append({
-            "name": name,
-            "host": host,
-            "port": int(port),
-            "unit": int(unit),
-        })
-    except ValueError:
-        print(f"⚠️ Invalid inverter entry: '{part}'", file=sys.stderr)
-
-# Thresholds
-MORNING_GRACE = timedelta(minutes=get_cfg("thresholds", "MORNING_GRACE_MIN", fallback=20, cast=float))
-EVENING_GRACE = timedelta(minutes=get_cfg("thresholds", "EVENING_GRACE_MIN", fallback=10, cast=float))
-ABS_MIN_WATTS = get_cfg("thresholds", "ABS_MIN_WATTS", fallback=150, cast=float)
-SAFE_DC_VOLT_MAX = get_cfg("thresholds", "SAFE_DC_VOLT_MAX", fallback=150, cast=float)
-ZERO_CURRENT_EPS = get_cfg("thresholds", "ZERO_CURRENT_EPS", fallback=0.05, cast=float)
-PEER_COMPARE = cfg.getboolean("thresholds", "PEER_COMPARE", fallback=True)
-PEER_MIN_WATTS = get_cfg("thresholds", "PEER_MIN_WATTS", fallback=600, cast=float)
-PEER_LOW_RATIO = get_cfg("thresholds", "PEER_LOW_RATIO", fallback=0.20, cast=float)
-MODBUS_TIMEOUT = get_cfg("thresholds", "MODBUS_TIMEOUT", fallback=1.0, cast=float)
-MODBUS_RETRIES = get_cfg("thresholds", "MODBUS_RETRIES", fallback=3, cast=int)
-
-# Alert repetition
-ALERT_REPEAT_COUNT = get_cfg("alerts", "ALERT_REPEAT_COUNT", fallback=3, cast=int)
-ALERT_REPEAT_WINDOW_MIN = get_cfg("alerts", "ALERT_REPEAT_WINDOW_MIN", fallback=30, cast=int)
-ALERT_STATE_FILE = get_cfg("alerts", "ALERT_STATE_FILE", fallback="/tmp/inverter_alert_state.json")
-
-# Healthchecks
-HEALTHCHECKS_URL = get_cfg("alerts", "HEALTHCHECKS_URL", fallback="").strip()
-
-# Pushover
-PUSHOVER_USER_KEY = get_cfg("pushover", "PUSHOVER_USER_KEY", fallback=None)
-PUSHOVER_API_TOKEN = get_cfg("pushover", "PUSHOVER_API_TOKEN", fallback=None)
-
-# SolarEdge Cloud API
-ENABLE_SOLAREDGE_API = cfg.getboolean("solaredge_api", "ENABLE_SOLAREDGE_API", fallback=False)
-SOLAREDGE_API_KEY = get_cfg("solaredge_api", "SOLAREDGE_API_KEY", fallback=None)
-SOLAREDGE_SITE_ID = get_cfg("solaredge_api", "SOLAREDGE_SITE_ID", fallback=None)
-
-# ---------------- DAILY SUMMARY CONFIG ----------------
-DAILY_SUMMARY_ENABLED = cfg.getboolean("alerts", "DAILY_SUMMARY_ENABLED", fallback=True)
-DAILY_SUMMARY_METHOD = get_cfg("alerts", "DAILY_SUMMARY_METHOD", fallback="api").strip().lower()  # "api" or "modbus"
-DAILY_SUMMARY_OFFSET_MIN = get_cfg("alerts", "DAILY_SUMMARY_OFFSET_MIN", fallback=60, cast=int)  # sunset + 60 min
 
 # ---------------- UTILITIES ----------------
 def load_optimizer_expectations():
@@ -474,8 +420,7 @@ def maybe_send_daily_summary(results):
 SIMULATED_NORMAL = {"status": 4, "pac_W": 5000.0, "vdc_V": 380.0, "idc_A": 13.0}
 
 # ---------------- CLI ARGUMENTS ----------------
-def build_arg_parser(inverter_names):
-    choices_str = ", ".join(inverter_names) if inverter_names else "none available"
+def build_arg_parser():
     examples = """\
 Examples:
   Normal run (verbose):
@@ -499,40 +444,119 @@ Exit Codes:
     ap = argparse.ArgumentParser(
         description=(
             "Monitor SolarEdge inverters via Modbus + optional Cloud API.\n"
-            "Sends alerts only after repeated detections (X over Y).\n\n"
-            f"(Available inverters: {choices_str})"
+            "Sends alerts only after repeated detections (X over Y)."
         ),
         formatter_class=RawTextHelpFormatter,
         epilog=f"{exit_codes}\n{examples}"
     )
-    ap.add_argument("--json", action="store_true", help="print full inverter readings as JSON and exit")
-    ap.add_argument("--verbose", action="store_true", help="emit detailed logs during checks")
-    ap.add_argument("--quiet", action="store_true", help="suppress non-error output (cron-friendly)")
+    ap.add_argument("--json", action="store_true",
+                    help="print full inverter readings as JSON and exit")
+    ap.add_argument("--verbose", action="store_true",
+                    help="emit detailed logs during checks")
+    ap.add_argument("--quiet", action="store_true",
+                    help="suppress non-error output (cron-friendly)")
     ap.add_argument("--simulate", choices=["off", "low", "fault", "offline"], default="off",
                     help="simulate a failure mode on an inverter (default: off)")
-    ap.add_argument("--simulate-target", metavar="NAME", choices=inverter_names,
-                    help=f"apply simulation to inverter (choices: {choices_str})")
+    ap.add_argument("--simulate-target", metavar="NAME",
+                    help="apply simulation to inverter by configured name (from [inverters] INVERTERS)")
     ap.add_argument("--test-pushover", action="store_true",
                     help="send a test notification to verify Pushover configuration")
     ap.add_argument("--force-summary", action="store_true",
                     help="force immediate daily summary (bypass sunset/time guard)")
     ap.add_argument("--debug", action="store_true",
-                help="enable extra debug output (API and Modbus details)")
+                    help="enable extra debug output (API and Modbus details)")
     ap.add_argument("--config", "-c", metavar="PATH",
-                help="path to monitor_inverters.conf (overrides default)")
+                    help="path to monitor_inverters.conf (overrides default)")
     return ap
 
+
+# ---------------- MAIN ----------------
 # ---------------- MAIN ----------------
 def main():
-    inverter_names = [inv["name"] for inv in INVERTERS]
-    ap = build_arg_parser(inverter_names)
+    global cfg
+    global CITY_NAME, LAT, LON, TZNAME
+    global ASTRAL_LOC
+    global INVERTERS
+    global MORNING_GRACE, EVENING_GRACE
+    global ABS_MIN_WATTS, SAFE_DC_VOLT_MAX, ZERO_CURRENT_EPS
+    global PEER_COMPARE, PEER_MIN_WATTS, PEER_LOW_RATIO
+    global MODBUS_TIMEOUT, MODBUS_RETRIES
+    global ALERT_REPEAT_COUNT, ALERT_REPEAT_WINDOW_MIN, ALERT_STATE_FILE
+    global HEALTHCHECKS_URL
+    global PUSHOVER_USER_KEY, PUSHOVER_API_TOKEN
+    global ENABLE_SOLAREDGE_API, SOLAREDGE_API_KEY, SOLAREDGE_SITE_ID
+    global DAILY_SUMMARY_ENABLED, DAILY_SUMMARY_METHOD, DAILY_SUMMARY_OFFSET_MIN
+
+    # 1) Build parser WITHOUT needing INVERTERS yet
+    ap = build_arg_parser()
     args = ap.parse_args()
 
-    # Load config file (default or CLI override)
+    # 2) Load config file (default or CLI override)
     config_path = args.config or "monitor_inverters.conf"
-    global cfg
     cfg = load_config(config_path)
 
+    # 3) Load config-derived values
+
+    # ---- Site / Astral ----
+    CITY_NAME = cfg.get("site", "CITY_NAME")
+    LAT = cfg.getfloat("site", "LAT")
+    LON = cfg.getfloat("site", "LON")
+    TZNAME = cfg.get("site", "TZNAME")
+
+    ASTRAL_LOC = LocationInfo(CITY_NAME, "USA", TZNAME, LAT, LON)
+
+    # ---- Inverters ----
+    INVERTERS = []
+    for part in cfg.get("inverters", "INVERTERS").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            name, host, port, unit = [x.strip() for x in part.split(":")]
+            INVERTERS.append({
+                "name": name,
+                "host": host,
+                "port": int(port),
+                "unit": int(unit),
+            })
+        except ValueError:
+            print(f"⚠️ Invalid inverter entry: '{part}'", file=sys.stderr)
+
+    # ---- Thresholds ----
+    MORNING_GRACE = timedelta(minutes=cfg.getfloat("thresholds", "MORNING_GRACE_MIN", fallback=20))
+    EVENING_GRACE = timedelta(minutes=cfg.getfloat("thresholds", "EVENING_GRACE_MIN", fallback=10))
+
+    ABS_MIN_WATTS = cfg.getfloat("thresholds", "ABS_MIN_WATTS", fallback=150)
+    SAFE_DC_VOLT_MAX = cfg.getfloat("thresholds", "SAFE_DC_VOLT_MAX", fallback=150)
+    ZERO_CURRENT_EPS = cfg.getfloat("thresholds", "ZERO_CURRENT_EPS", fallback=0.05)
+
+    PEER_COMPARE = cfg.getboolean("thresholds", "PEER_COMPARE", fallback=True)
+    PEER_MIN_WATTS = cfg.getfloat("thresholds", "PEER_MIN_WATTS", fallback=600)
+    PEER_LOW_RATIO = cfg.getfloat("thresholds", "PEER_LOW_RATIO", fallback=0.20)
+
+    MODBUS_TIMEOUT = cfg.getfloat("thresholds", "MODBUS_TIMEOUT", fallback=1.0)
+    MODBUS_RETRIES = cfg.getint("thresholds", "MODBUS_RETRIES", fallback=3)
+
+    # ---- Alerts ----
+    ALERT_REPEAT_COUNT = cfg.getint("alerts", "ALERT_REPEAT_COUNT", fallback=3)
+    ALERT_REPEAT_WINDOW_MIN = cfg.getint("alerts", "ALERT_REPEAT_WINDOW_MIN", fallback=30)
+    ALERT_STATE_FILE = cfg.get("alerts", "ALERT_STATE_FILE", fallback="/tmp/inverter_alert_state.json")
+
+    HEALTHCHECKS_URL = cfg.get("alerts", "HEALTHCHECKS_URL", fallback="").strip()
+
+    # ---- Pushover ----
+    PUSHOVER_USER_KEY = cfg.get("pushover", "PUSHOVER_USER_KEY", fallback=None)
+    PUSHOVER_API_TOKEN = cfg.get("pushover", "PUSHOVER_API_TOKEN", fallback=None)
+
+    # ---- SolarEdge Cloud API ----
+    ENABLE_SOLAREDGE_API = cfg.getboolean("solaredge_api", "ENABLE_SOLAREDGE_API", fallback=False)
+    SOLAREDGE_API_KEY = cfg.get("solaredge_api", "SOLAREDGE_API_KEY", fallback=None)
+    SOLAREDGE_SITE_ID = cfg.get("solaredge_api", "SOLAREDGE_SITE_ID", fallback=None)
+
+    # ---- Daily summary ----
+    DAILY_SUMMARY_ENABLED = cfg.getboolean("alerts", "DAILY_SUMMARY_ENABLED", fallback=True)
+    DAILY_SUMMARY_METHOD = cfg.get("alerts", "DAILY_SUMMARY_METHOD", fallback="api").strip().lower()
+    DAILY_SUMMARY_OFFSET_MIN = cfg.getint("alerts", "DAILY_SUMMARY_OFFSET_MIN", fallback=60)
 
     # --- Verbose module info ---
     if args.verbose and not args.quiet:
@@ -576,8 +600,6 @@ def main():
             if not r.get("error"):
                 any_success = True
                 if args.verbose and not args.quiet:
-                    # Defensive formatting: numeric fields may be None, avoid
-                    # raising on `:.0f`/`:.2f` when values are missing.
                     pac = r.get("pac_W")
                     vdc = r.get("vdc_V")
                     idc = r.get("idc_A")
@@ -586,7 +608,6 @@ def main():
                     vdc_s = f"{vdc:.1f}V" if isinstance(vdc, (int, float)) else "N/A"
                     idc_s = f"{idc:.2f}A" if isinstance(idc, (int, float)) else "N/A"
                     log(f"[{r['id']}] (modbus) PAC={pac_s} Vdc={vdc_s} Idc={idc_s} status={status}")
-
 
     # --- Simulation injection ---
     simulation_info = None
