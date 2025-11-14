@@ -41,10 +41,11 @@ from config import ConfigManager
 from inverter_reader import InverterReader, ReaderSettings
 from anomaly_detector import AnomalyDetector, DetectionSettings
 from solaredge_api_checker import SolarEdgeAPIChecker
+from daily_summary import DailySummaryManager, DailySummaryConfig
+
 
 from utils import (
     clean_serial,
-    model_base,
     inv_display_from_parts,
     extract_serial_from_text,
 )
@@ -224,96 +225,96 @@ def update_inverter_states(results):
     return recoveries
 
 # ---------------- DAILY SUMMARY ----------------
-def _fetch_site_daily_kwh_api():
-    """Return dict {"site_total": kWh} for today using SolarEdge API, with verbose debug."""
-    if not (ENABLE_SOLAREDGE_API and SOLAREDGE_API_KEY and SOLAREDGE_SITE_ID):
-        print("🔍 [DEBUG] API disabled or missing key/site id.")
-        return None
-    base = "https://monitoringapi.solaredge.com"
-    session = requests.Session()
-    today = datetime.now().strftime("%Y-%m-%d")
-    params = {
-        "timeUnit": "DAY",
-        "startDate": today,
-        "endDate": today,
-        "api_key": SOLAREDGE_API_KEY,
-    }
-    url = f"{base}/site/{SOLAREDGE_SITE_ID}/energy"
-    try:
-        r = session.get(url, params=params, timeout=20)
-        if r.status_code != 200:
-            print("⚠️ [DEBUG] Non-200 from API; aborting site energy fetch.")
-            return None
-        j = r.json()
-        energy = j.get("energy", {})
-        values = energy.get("values", [])
-        if not values:
-            return None
-        first = values[0]
-        total_Wh = first.get("value")
-        if total_Wh is None:
-            return None
-        total_kWh = round(float(total_Wh) / 1000.0, 2)
-        return {"site_total": total_kWh}
-    except Exception as e:
-        print(f"⚠️ [DEBUG] Exception in _fetch_site_daily_kwh_api: {e}", file=sys.stderr)
-        return None
+# def _fetch_site_daily_kwh_api():
+#     """Return dict {"site_total": kWh} for today using SolarEdge API, with verbose debug."""
+#     if not (ENABLE_SOLAREDGE_API and SOLAREDGE_API_KEY and SOLAREDGE_SITE_ID):
+#         print("🔍 [DEBUG] API disabled or missing key/site id.")
+#         return None
+#     base = "https://monitoringapi.solaredge.com"
+#     session = requests.Session()
+#     today = datetime.now().strftime("%Y-%m-%d")
+#     params = {
+#         "timeUnit": "DAY",
+#         "startDate": today,
+#         "endDate": today,
+#         "api_key": SOLAREDGE_API_KEY,
+#     }
+#     url = f"{base}/site/{SOLAREDGE_SITE_ID}/energy"
+#     try:
+#         r = session.get(url, params=params, timeout=20)
+#         if r.status_code != 200:
+#             print("⚠️ [DEBUG] Non-200 from API; aborting site energy fetch.")
+#             return None
+#         j = r.json()
+#         energy = j.get("energy", {})
+#         values = energy.get("values", [])
+#         if not values:
+#             return None
+#         first = values[0]
+#         total_Wh = first.get("value")
+#         if total_Wh is None:
+#             return None
+#         total_kWh = round(float(total_Wh) / 1000.0, 2)
+#         return {"site_total": total_kWh}
+#     except Exception as e:
+#         print(f"⚠️ [DEBUG] Exception in _fetch_site_daily_kwh_api: {e}", file=sys.stderr)
+#         return None
 
-def _compute_per_inverter_daily_kwh_modbus(results):
-    """Compute per-inverter kWh for today from lifetime Wh deltas."""
-    state = load_alert_state()
-    date_str = now_local().strftime("%Y-%m-%d")
-    totals = {}
-    for r in results:
-        key_display = inv_display_from_parts(r.get("model"), r.get("serial"))
-        key_state = f"{clean_serial(r.get('serial')) or key_display.upper()}:{date_str}"
-        e_total_Wh = r.get("e_total_Wh")
-        if e_total_Wh is None:
-            continue
-        energy_state = state.setdefault("energy", {})
-        baseline = energy_state.get(key_state)
-        if baseline is None:
-            energy_state[key_state] = e_total_Wh
-            delta_Wh = 0.0
-        else:
-            delta_Wh = max(0.0, e_total_Wh - float(baseline))
-        totals[key_display] = round(delta_Wh / 1000.0, 2)
-    save_alert_state(state)
-    return totals
+# def _compute_per_inverter_daily_kwh_modbus(results):
+#     """Compute per-inverter kWh for today from lifetime Wh deltas."""
+#     state = load_alert_state()
+#     date_str = now_local().strftime("%Y-%m-%d")
+#     totals = {}
+#     for r in results:
+#         key_display = inv_display_from_parts(r.get("model"), r.get("serial"))
+#         key_state = f"{clean_serial(r.get('serial')) or key_display.upper()}:{date_str}"
+#         e_total_Wh = r.get("e_total_Wh")
+#         if e_total_Wh is None:
+#             continue
+#         energy_state = state.setdefault("energy", {})
+#         baseline = energy_state.get(key_state)
+#         if baseline is None:
+#             energy_state[key_state] = e_total_Wh
+#             delta_Wh = 0.0
+#         else:
+#             delta_Wh = max(0.0, e_total_Wh - float(baseline))
+#         totals[key_display] = round(delta_Wh / 1000.0, 2)
+#     save_alert_state(state)
+#     return totals
 
-def maybe_send_daily_summary(results):
-    """Send once-per-day summary at (sunset + DAILY_SUMMARY_OFFSET_MIN) or immediately if forced."""
-    if not DAILY_SUMMARY_ENABLED:
-        return
-    dt_local = now_local()
-    date_str = dt_local.strftime("%Y-%m-%d")
-    state = load_alert_state()
-    last = state.get("daily_summary", {})
-    forced = "--force-summary" in sys.argv
-    if not forced:
-        if last.get("date") == date_str and last.get("sent"):
-            return
-        _, _, sunset = solar_window(dt_local)
-        trigger_time = sunset + timedelta(minutes=DAILY_SUMMARY_OFFSET_MIN)
-        if dt_local < trigger_time:
-            return
-    per_inv = None
-    if DAILY_SUMMARY_METHOD == "api":
-        per_inv = _fetch_site_daily_kwh_api()
-    if per_inv is None:
-        print("🔍 [DEBUG] API fetch failed or empty; trying Modbus fallback.")
-        per_inv = _compute_per_inverter_daily_kwh_modbus(results)
-    if not per_inv:
-        print("⚠️ [DEBUG] No daily summary data found; aborting.")
-        return
-    total = round(sum(v for v in per_inv.values()), 2)
-    lines = [f"{n}: {v:.2f} kWh" for n, v in sorted(per_inv.items())]
-    lines.append(f"Total: {total:.2f} kWh")
-    msg = "\n".join(lines)
-    print(msg)
-    pushover_notify(f"SolarEdge Daily Summary — {date_str}", msg, priority=0)
-    state["daily_summary"] = {"date": date_str, "sent": True}
-    save_alert_state(state)
+# def maybe_send_daily_summary(results):
+#     """Send once-per-day summary at (sunset + DAILY_SUMMARY_OFFSET_MIN) or immediately if forced."""
+#     if not DAILY_SUMMARY_ENABLED:
+#         return
+#     dt_local = now_local()
+#     date_str = dt_local.strftime("%Y-%m-%d")
+#     state = load_alert_state()
+#     last = state.get("daily_summary", {})
+#     forced = "--force-summary" in sys.argv
+#     if not forced:
+#         if last.get("date") == date_str and last.get("sent"):
+#             return
+#         _, _, sunset = solar_window(dt_local)
+#         trigger_time = sunset + timedelta(minutes=DAILY_SUMMARY_OFFSET_MIN)
+#         if dt_local < trigger_time:
+#             return
+#     per_inv = None
+#     if DAILY_SUMMARY_METHOD == "api":
+#         per_inv = _fetch_site_daily_kwh_api()
+#     if per_inv is None:
+#         print("🔍 [DEBUG] API fetch failed or empty; trying Modbus fallback.")
+#         per_inv = _compute_per_inverter_daily_kwh_modbus(results)
+#     if not per_inv:
+#         print("⚠️ [DEBUG] No daily summary data found; aborting.")
+#         return
+#     total = round(sum(v for v in per_inv.values()), 2)
+#     lines = [f"{n}: {v:.2f} kWh" for n, v in sorted(per_inv.items())]
+#     lines.append(f"Total: {total:.2f} kWh")
+#     msg = "\n".join(lines)
+#     print(msg)
+#     pushover_notify(f"SolarEdge Daily Summary — {date_str}", msg, priority=0)
+#     state["daily_summary"] = {"date": date_str, "sent": True}
+#     save_alert_state(state)
 
 # ---------------- SIMULATION CONSTANTS ----------------
 SIMULATED_NORMAL = {"status": 4, "pac_W": 5000.0, "vdc_V": 380.0, "idc_A": 13.0}
@@ -453,6 +454,24 @@ def main():
     DAILY_SUMMARY_ENABLED = cfg.alerts.daily_enabled
     DAILY_SUMMARY_METHOD = cfg.alerts.daily_method
     DAILY_SUMMARY_OFFSET_MIN = cfg.alerts.daily_offset_min
+
+    # Daily Summary Manager (Stage 4.4)
+    daily_cfg = DailySummaryConfig(
+        enabled=cfg.alerts.daily_enabled,
+        method=cfg.alerts.daily_method,
+        offset_min=cfg.alerts.daily_offset_min,
+        api_key=cfg.api.api_key,
+        site_id=cfg.api.site_id,
+    )
+
+    daily_mgr = DailySummaryManager(
+        cfg=daily_cfg,
+        astral_loc=ASTRAL_LOC,
+        status_func=status_text,
+        state_file=ALERT_STATE_FILE,
+        debug=args.debug,
+    )
+
 
     # Instantiate SolarEdge API checker (Stage 4.1)
     total_expected, expected_by_serial = load_optimizer_expectations()
@@ -660,7 +679,11 @@ def main():
     try:
         if args.force_summary:
             log("📊 Forcing daily summary now (--force-summary).")
-        maybe_send_daily_summary(read_ok)
+        summary = daily_mgr.maybe_generate_summary(read_ok, force=args.force_summary)
+        if summary:
+            log(summary)
+            date_str = now_local().strftime("%Y-%m-%d")
+            pushover_notify(f"SolarEdge Daily Summary — {date_str}", summary, priority=0)
     except Exception as e:
         log(f"⚠️ Failed to compute/send daily summary: {e}", err=True)
 
