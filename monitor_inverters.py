@@ -290,7 +290,9 @@ def read_inverter(inv, verbose=False):
     except (socket.error, OSError, Exception) as e:
         if verbose:
             print(f"[{inv['name']}] ERROR reading inverter: {e}", file=sys.stderr)
-        return {"id": inv["name"], "error": True}
+        # Ensure returned dict always contains the configured `name` field
+        # so downstream code (simulation/selection) can safely reference it.
+        return {"name": inv["name"], "id": inv["name"], "model": None, "serial": None, "error": True}
 
     model = v.get("c_model") or v.get("model")
     serial = v.get("c_serialnumber") or v.get("serialnumber")
@@ -566,8 +568,16 @@ def main():
             if not r.get("error"):
                 any_success = True
                 if args.verbose and not args.quiet:
-                    log(f"[{r['id']}] (modbus) PAC={r['pac_W']:.0f}W Vdc={r['vdc_V']:.1f}V "
-                        f"Idc={r['idc_A']:.2f}A status={status_text(r['status'])}")
+                    # Defensive formatting: numeric fields may be None, avoid
+                    # raising on `:.0f`/`:.2f` when values are missing.
+                    pac = r.get("pac_W")
+                    vdc = r.get("vdc_V")
+                    idc = r.get("idc_A")
+                    status = status_text(r.get("status"))
+                    pac_s = f"{pac:.0f}W" if isinstance(pac, (int, float)) else "N/A"
+                    vdc_s = f"{vdc:.1f}V" if isinstance(vdc, (int, float)) else "N/A"
+                    idc_s = f"{idc:.2f}A" if isinstance(idc, (int, float)) else "N/A"
+                    log(f"[{r['id']}] (modbus) PAC={pac_s} Vdc={vdc_s} Idc={idc_s} status={status}")
 
 
     # --- Simulation injection ---
@@ -576,20 +586,24 @@ def main():
         target = None
         if args.simulate_target:
             for r in results:
-                if r["name"] == args.simulate_target:
+                if r.get("name") == args.simulate_target:
                     target = r
                     break
             if target is None:
-                log(f"⚠️ No inverter found with name '{args.simulate_target}', using first inverter instead.")
-                target = results[0]
+                log(f"⚠️ No inverter found with name '{args.simulate_target}', using first available inverter instead.")
+                # prefer a non-error candidate if possible
+                target = next((x for x in results if not x.get("error") and x.get("name")), results[0])
         else:
             # Default: lowest kW model
             def extract_kw(inv):
                 import re
-                model = inv.get("model", "") or inv["name"]
+                model = inv.get("model") or inv.get("name", "")
                 m = re.search(r"(\d{4,5})", model)
                 return int(m.group(1)) if m else 99999
-            target = min(results, key=extract_kw)
+            candidates = [r for r in results if not r.get("error")]
+            if not candidates:
+                candidates = results
+            target = min(candidates, key=extract_kw)
 
         log(f"🔧 Simulating inverter '{target['name']}' in mode '{args.simulate}'")
         simulation_info = f"{args.simulate} on {target['name']}"
@@ -621,8 +635,25 @@ def main():
         return 0
 
     if not any_success:
-        log("ERROR: no inverter responded", err=True)
-        ping_healthcheck("fail", message="No inverter responded")
+        # All modbus communication failed → generate a real alert
+        alerts = ["All inverters: Modbus communication failed"]
+
+        confirmed = []
+        for msg in alerts:
+            k = key_for_alert_message(msg)
+            if should_alert(k):
+                confirmed.append(msg)
+
+        if confirmed:
+            msg = "\n".join(confirmed)
+            log(f"ALERT:\n{msg}")
+            pushover_notify("SolarEdge Monitor Alert", msg, priority=1)
+            ping_healthcheck("fail", message=confirmed[0])
+            return 2
+
+        # Suppressed; still count as error but not an alert
+        log("Modbus communication failed (suppressed during repeat window)")
+        ping_healthcheck("fail", message="Modbus comm failure")
         return 1
 
     all_sleeping = all(r.get("status") == 2 for r in results if not r.get("error"))
