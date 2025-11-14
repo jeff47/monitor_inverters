@@ -21,7 +21,7 @@ import urllib.request
 import urllib.parse
 import urllib.error
 import pytz
-import configparser
+# import configparser
 # import solaredge_modbus
 from astral import LocationInfo
 from astral.sun import sun
@@ -36,6 +36,8 @@ import re
 from pathlib import Path
 import importlib.util
 from config import ConfigManager
+from inverter_reader import InverterReader, ReaderSettings
+
 
 # -------- Load developmental solaredge_modbus module instead of system version --------
 mod_path = Path("/home/jeff/projects/personal/solaredge_modbus/src/solaredge_modbus/__init__.py")
@@ -90,15 +92,15 @@ def key_for_alert_message(msg: str) -> str:
 
 # ---------------- CONFIG LOADING ----------------
 
-def load_config(path="monitor_inverters.conf"):
-    """Read configuration from INI file using configparser."""
-    parser = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
-    parser.optionxform = str  # preserve case
-    if not os.path.exists(path):
-        print(f"⚠️ Config file not found: {path}", file=sys.stderr)
-        sys.exit(1)
-    parser.read(path)
-    return parser
+# def load_config(path="monitor_inverters.conf"):
+#     """Read configuration from INI file using configparser."""
+#     parser = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
+#     parser.optionxform = str  # preserve case
+#     if not os.path.exists(path):
+#         print(f"⚠️ Config file not found: {path}", file=sys.stderr)
+#         sys.exit(1)
+#     parser.read(path)
+#     return parser
 
 # ---------------- UTILITIES ----------------
 def load_optimizer_expectations():
@@ -179,16 +181,16 @@ def solar_window(dt_local):
     sunset = s["sunset"] - EVENING_GRACE
     return (sunrise <= dt_local <= sunset, sunrise, sunset)
 
-def scaled(values, name):
-    """Return scaled numeric value (applies *_scale if present)."""
-    if name not in values:
-        return None
-    raw = values.get(name)
-    scale = 10 ** values.get(f"{name}_scale", 0)
-    try:
-        return float(raw) * float(scale)
-    except Exception:
-        return None
+# def scaled(values, name):
+#     """Return scaled numeric value (applies *_scale if present)."""
+#     if name not in values:
+#         return None
+#     raw = values.get(name)
+#     scale = 10 ** values.get(f"{name}_scale", 0)
+#     try:
+#         return float(raw) * float(scale)
+#     except Exception:
+#         return None
 
 def status_text(code: int) -> str:
     """Return descriptive status name."""
@@ -204,44 +206,44 @@ def status_text(code: int) -> str:
     }
     return explicit.get(code, f"Unknown({code})")
 
-def read_inverter(inv, verbose=False):
-    """Read key metrics from one inverter."""
-    try:
-        socket.gethostbyname(inv["host"])
-        inverter = solaredge_modbus.Inverter(
-            host=inv["host"],
-            port=inv["port"],
-            timeout=MODBUS_TIMEOUT,
-            retries=MODBUS_RETRIES,
-            unit=inv["unit"],
-        )
-        v = inverter.read_all()
-    except (socket.error, OSError, Exception) as e:
-        if verbose:
-            print(f"[{inv['name']}] ERROR reading inverter: {e}", file=sys.stderr)
-        # Ensure returned dict always contains the configured `name` field
-        # so downstream code (simulation/selection) can safely reference it.
-        return {"name": inv["name"], "id": inv["name"], "model": None, "serial": None, "error": True}
+# def read_inverter(inv, verbose=False):
+#     """Read key metrics from one inverter."""
+#     try:
+#         socket.gethostbyname(inv["host"])
+#         inverter = solaredge_modbus.Inverter(
+#             host=inv["host"],
+#             port=inv["port"],
+#             timeout=MODBUS_TIMEOUT,
+#             retries=MODBUS_RETRIES,
+#             unit=inv["unit"],
+#         )
+#         v = inverter.read_all()
+#     except (socket.error, OSError, Exception) as e:
+#         if verbose:
+#             print(f"[{inv['name']}] ERROR reading inverter: {e}", file=sys.stderr)
+#         # Ensure returned dict always contains the configured `name` field
+#         # so downstream code (simulation/selection) can safely reference it.
+#         return {"name": inv["name"], "id": inv["name"], "model": None, "serial": None, "error": True}
 
-    model = v.get("c_model") or v.get("model")
-    serial = v.get("c_serialnumber") or v.get("serialnumber")
-    id_str = inv_display_from_parts(model, serial)
+#     model = v.get("c_model") or v.get("model")
+#     serial = v.get("c_serialnumber") or v.get("serialnumber")
+#     id_str = inv_display_from_parts(model, serial)
 
-    return {
-        "name": inv["name"],     # configured nickname
-        "id": id_str,            # canonical visible identity
-        "model": model,
-        "serial": clean_serial(serial),
-        "status": v.get("status"),
-        "vendor_status": v.get("vendor_status"),
-        "pac_W": scaled(v, "power_ac"),
-        "vdc_V": scaled(v, "voltage_dc"),
-        "idc_A": scaled(v, "current_dc"),
-        "temp_C": scaled(v, "temperature"),
-        "freq_Hz": scaled(v, "frequency"),
-        "e_total_Wh": scaled(v, "energy_total") or scaled(v, "total_energy"),
-        "raw": v,
-    }
+#     return {
+#         "name": inv["name"],     # configured nickname
+#         "id": id_str,            # canonical visible identity
+#         "model": model,
+#         "serial": clean_serial(serial),
+#         "status": v.get("status"),
+#         "vendor_status": v.get("vendor_status"),
+#         "pac_W": scaled(v, "power_ac"),
+#         "vdc_V": scaled(v, "voltage_dc"),
+#         "idc_A": scaled(v, "current_dc"),
+#         "temp_C": scaled(v, "temperature"),
+#         "freq_Hz": scaled(v, "frequency"),
+#         "e_total_Wh": scaled(v, "energy_total") or scaled(v, "total_energy"),
+#         "raw": v,
+#     }
 
 # ---------------- ALERT REPETITION CONTROL ----------------
 
@@ -525,6 +527,13 @@ def main():
     DAILY_SUMMARY_METHOD = cfg.alerts.daily_method
     DAILY_SUMMARY_OFFSET_MIN = cfg.alerts.daily_offset_min
 
+    reader = InverterReader(
+        ReaderSettings(
+            timeout=MODBUS_TIMEOUT,
+            retries=MODBUS_RETRIES,
+        )
+    )
+
     # --- Verbose module info ---
     if args.verbose and not args.quiet:
         print(f"solaredge_modbus version: {getattr(solaredge_modbus, '__version__', '(unknown)')}")
@@ -555,7 +564,7 @@ def main():
 
     # Threaded Modbus reads
     with ThreadPoolExecutor(max_workers=min(8, len(INVERTERS) or 1)) as executor:
-        futures = {executor.submit(read_inverter, inv, args.verbose): inv for inv in INVERTERS}
+        futures = {executor.submit(reader.read_one, inv): inv for inv in INVERTERS}
         for future in as_completed(futures):
             inv = futures[future]
             try:
