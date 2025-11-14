@@ -26,7 +26,7 @@ import pytz
 from astral import LocationInfo
 from astral.sun import sun
 import requests
-import datetime as dt
+#import datetime as dt
 from datetime import datetime, timedelta
 import argparse
 from argparse import RawTextHelpFormatter
@@ -449,6 +449,11 @@ def main():
     SOLAREDGE_API_KEY = cfg.api.api_key
     SOLAREDGE_SITE_ID = cfg.api.site_id
 
+    # Daily Summary
+    DAILY_SUMMARY_ENABLED = cfg.alerts.daily_enabled
+    DAILY_SUMMARY_METHOD = cfg.alerts.daily_method
+    DAILY_SUMMARY_OFFSET_MIN = cfg.alerts.daily_offset_min
+
     # Instantiate SolarEdge API checker (Stage 4.1)
     total_expected, expected_by_serial = load_optimizer_expectations()
 
@@ -461,10 +466,6 @@ def main():
     )
 
 
-    # Daily Summary
-    DAILY_SUMMARY_ENABLED = cfg.alerts.daily_enabled
-    DAILY_SUMMARY_METHOD = cfg.alerts.daily_method
-    DAILY_SUMMARY_OFFSET_MIN = cfg.alerts.daily_offset_min
 
     reader = InverterReader(
         ReaderSettings(
@@ -626,7 +627,6 @@ def main():
             display = inv_display_from_parts(r.get("model"), r.get("serial"))
             alerts.append(f"{display}: Modbus read failed")
 
-    # Cloud API checks
     cloud_alerts = api_checker.check(read_ok)
 
     if cloud_alerts:
