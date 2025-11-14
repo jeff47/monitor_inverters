@@ -35,6 +35,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
 from pathlib import Path
 import importlib.util
+from config import ConfigManager
 
 # -------- Load developmental solaredge_modbus module instead of system version --------
 mod_path = Path("/home/jeff/projects/personal/solaredge_modbus/src/solaredge_modbus/__init__.py")
@@ -42,26 +43,6 @@ spec = importlib.util.spec_from_file_location("solaredge_modbus", mod_path)
 solaredge_modbus = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(solaredge_modbus)
 sys.modules["solaredge_modbus"] = solaredge_modbus
-
-# Filled dynamically inside main()
-cfg = None
-CITY_NAME = LAT = LON = TZNAME = None
-ASTRAL_LOC = None
-INVERTERS = []
-MORNING_GRACE = EVENING_GRACE = None
-ABS_MIN_WATTS = SAFE_DC_VOLT_MAX = ZERO_CURRENT_EPS = None
-PEER_COMPARE = PEER_MIN_WATTS = PEER_LOW_RATIO = None
-MODBUS_TIMEOUT = MODBUS_RETRIES = None
-ALERT_REPEAT_COUNT = ALERT_REPEAT_WINDOW_MIN = None
-ALERT_STATE_FILE = None
-HEALTHCHECKS_URL = None
-PUSHOVER_USER_KEY = PUSHOVER_API_TOKEN = None
-ENABLE_SOLAREDGE_API = None
-SOLAREDGE_API_KEY = SOLAREDGE_SITE_ID = None
-DAILY_SUMMARY_ENABLED = None
-DAILY_SUMMARY_METHOD = None
-DAILY_SUMMARY_OFFSET_MIN = None
-
 
 # ---------------- IDENTITY HELPERS ----------------
 
@@ -129,8 +110,10 @@ def load_optimizer_expectations():
     total_expected = None
     per_inv_expected = {}
 
-    if cfg.has_section("optimizers"):
-        for key, val in cfg.items("optimizers"):
+    parser = cfg.parser
+
+    if parser.has_section("optimizers"):
+        for key, val in parser.items("optimizers"):
             key_up = key.strip().upper()
             try:
                 count = int(str(val).strip())
@@ -471,7 +454,6 @@ Exit Codes:
 
 
 # ---------------- MAIN ----------------
-# ---------------- MAIN ----------------
 def main():
     global cfg
     global CITY_NAME, LAT, LON, TZNAME
@@ -487,76 +469,61 @@ def main():
     global ENABLE_SOLAREDGE_API, SOLAREDGE_API_KEY, SOLAREDGE_SITE_ID
     global DAILY_SUMMARY_ENABLED, DAILY_SUMMARY_METHOD, DAILY_SUMMARY_OFFSET_MIN
 
-    # 1) Build parser WITHOUT needing INVERTERS yet
     ap = build_arg_parser()
     args = ap.parse_args()
 
-    # 2) Load config file (default or CLI override)
-    config_path = args.config or "monitor_inverters.conf"
-    cfg = load_config(config_path)
+    # Load config using our new class
+    cfg = ConfigManager(args.config or "monitor_inverters.conf")
 
-    # 3) Load config-derived values
-
-    # ---- Site / Astral ----
-    CITY_NAME = cfg.get("site", "CITY_NAME")
-    LAT = cfg.getfloat("site", "LAT")
-    LON = cfg.getfloat("site", "LON")
-    TZNAME = cfg.get("site", "TZNAME")
+    # Site / Astral
+    CITY_NAME = cfg.site.city_name
+    LAT = cfg.site.lat
+    LON = cfg.site.lon
+    TZNAME = cfg.site.tzname
 
     ASTRAL_LOC = LocationInfo(CITY_NAME, "USA", TZNAME, LAT, LON)
 
-    # ---- Inverters ----
+    # Inverters
     INVERTERS = []
-    for part in cfg.get("inverters", "INVERTERS").split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            name, host, port, unit = [x.strip() for x in part.split(":")]
-            INVERTERS.append({
-                "name": name,
-                "host": host,
-                "port": int(port),
-                "unit": int(unit),
-            })
-        except ValueError:
-            print(f"⚠️ Invalid inverter entry: '{part}'", file=sys.stderr)
+    for inv_cfg in cfg.inverters:
+        INVERTERS.append({
+            "name": inv_cfg.name,
+            "host": inv_cfg.host,
+            "port": inv_cfg.port,
+            "unit": inv_cfg.unit,
+        })
 
-    # ---- Thresholds ----
-    MORNING_GRACE = timedelta(minutes=cfg.getfloat("thresholds", "MORNING_GRACE_MIN", fallback=20))
-    EVENING_GRACE = timedelta(minutes=cfg.getfloat("thresholds", "EVENING_GRACE_MIN", fallback=10))
+    # Thresholds
+    MORNING_GRACE = cfg.thresholds.morning_grace
+    EVENING_GRACE = cfg.thresholds.evening_grace
+    ABS_MIN_WATTS = cfg.thresholds.abs_min_watts
+    SAFE_DC_VOLT_MAX = cfg.thresholds.safe_dc_volt_max
+    ZERO_CURRENT_EPS = cfg.thresholds.zero_current_eps
+    PEER_COMPARE = cfg.thresholds.peer_compare
+    PEER_MIN_WATTS = cfg.thresholds.peer_min_watts
+    PEER_LOW_RATIO = cfg.thresholds.peer_low_ratio
+    MODBUS_TIMEOUT = cfg.thresholds.modbus_timeout
+    MODBUS_RETRIES = cfg.thresholds.modbus_retries
 
-    ABS_MIN_WATTS = cfg.getfloat("thresholds", "ABS_MIN_WATTS", fallback=150)
-    SAFE_DC_VOLT_MAX = cfg.getfloat("thresholds", "SAFE_DC_VOLT_MAX", fallback=150)
-    ZERO_CURRENT_EPS = cfg.getfloat("thresholds", "ZERO_CURRENT_EPS", fallback=0.05)
+    # Alerts
+    ALERT_REPEAT_COUNT = cfg.alerts.repeat_count
+    ALERT_REPEAT_WINDOW_MIN = cfg.alerts.repeat_window_min
+    ALERT_STATE_FILE = cfg.alerts.state_file
+    HEALTHCHECKS_URL = cfg.alerts.healthchecks_url
 
-    PEER_COMPARE = cfg.getboolean("thresholds", "PEER_COMPARE", fallback=True)
-    PEER_MIN_WATTS = cfg.getfloat("thresholds", "PEER_MIN_WATTS", fallback=600)
-    PEER_LOW_RATIO = cfg.getfloat("thresholds", "PEER_LOW_RATIO", fallback=0.20)
+    # Pushover
+    PUSHOVER_USER_KEY = cfg.pushover.user_key
+    PUSHOVER_API_TOKEN = cfg.pushover.api_token
 
-    MODBUS_TIMEOUT = cfg.getfloat("thresholds", "MODBUS_TIMEOUT", fallback=1.0)
-    MODBUS_RETRIES = cfg.getint("thresholds", "MODBUS_RETRIES", fallback=3)
+    # Cloud API
+    ENABLE_SOLAREDGE_API = cfg.api.enabled
+    SOLAREDGE_API_KEY = cfg.api.api_key
+    SOLAREDGE_SITE_ID = cfg.api.site_id
 
-    # ---- Alerts ----
-    ALERT_REPEAT_COUNT = cfg.getint("alerts", "ALERT_REPEAT_COUNT", fallback=3)
-    ALERT_REPEAT_WINDOW_MIN = cfg.getint("alerts", "ALERT_REPEAT_WINDOW_MIN", fallback=30)
-    ALERT_STATE_FILE = cfg.get("alerts", "ALERT_STATE_FILE", fallback="/tmp/inverter_alert_state.json")
-
-    HEALTHCHECKS_URL = cfg.get("alerts", "HEALTHCHECKS_URL", fallback="").strip()
-
-    # ---- Pushover ----
-    PUSHOVER_USER_KEY = cfg.get("pushover", "PUSHOVER_USER_KEY", fallback=None)
-    PUSHOVER_API_TOKEN = cfg.get("pushover", "PUSHOVER_API_TOKEN", fallback=None)
-
-    # ---- SolarEdge Cloud API ----
-    ENABLE_SOLAREDGE_API = cfg.getboolean("solaredge_api", "ENABLE_SOLAREDGE_API", fallback=False)
-    SOLAREDGE_API_KEY = cfg.get("solaredge_api", "SOLAREDGE_API_KEY", fallback=None)
-    SOLAREDGE_SITE_ID = cfg.get("solaredge_api", "SOLAREDGE_SITE_ID", fallback=None)
-
-    # ---- Daily summary ----
-    DAILY_SUMMARY_ENABLED = cfg.getboolean("alerts", "DAILY_SUMMARY_ENABLED", fallback=True)
-    DAILY_SUMMARY_METHOD = cfg.get("alerts", "DAILY_SUMMARY_METHOD", fallback="api").strip().lower()
-    DAILY_SUMMARY_OFFSET_MIN = cfg.getint("alerts", "DAILY_SUMMARY_OFFSET_MIN", fallback=60)
+    # Daily Summary
+    DAILY_SUMMARY_ENABLED = cfg.alerts.daily_enabled
+    DAILY_SUMMARY_METHOD = cfg.alerts.daily_method
+    DAILY_SUMMARY_OFFSET_MIN = cfg.alerts.daily_offset_min
 
     # --- Verbose module info ---
     if args.verbose and not args.quiet:
