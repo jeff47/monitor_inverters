@@ -40,6 +40,7 @@ import importlib.util
 from config import ConfigManager
 from inverter_reader import InverterReader, ReaderSettings
 from anomaly_detector import AnomalyDetector, DetectionSettings
+from solaredge_api_checker import SolarEdgeAPIChecker
 
 from utils import (
     clean_serial,
@@ -56,41 +57,6 @@ solaredge_modbus = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(solaredge_modbus)
 sys.modules["solaredge_modbus"] = solaredge_modbus
 
-# ---------------- IDENTITY HELPERS ----------------
-
-# SERIAL_RE = re.compile(r"([0-9A-Fa-f]{6,})")
-
-# def clean_serial(s: str) -> str:
-#     """Return uppercased serial without SolarEdge suffixes like '-CF'."""
-#     if not s:
-#         return ""
-#     return s.split("-")[0].upper().strip()
-
-# def model_base(model: str) -> str:
-#     """Return model truncated at first hyphen (e.g., 'SE7600H-US000BNI4' -> 'SE7600H')."""
-#     if not model:
-#         return ""
-#     return model.split("-", 1)[0].strip()
-
-# def inv_display_from_parts(model: str, serial: str) -> str:
-#     """Canonical visible identity: 'MODELBASE [SERIAL]' when both present."""
-#     mb = model_base(model)
-#     ser = clean_serial(serial)
-#     if mb and ser:
-#         return f"{mb} [{ser}]"
-#     if ser:
-#         return f"[{ser}]"
-#     return mb or "UNKNOWN"
-
-# def extract_serial_from_text(s: str) -> str:
-#     """Find serial inside square brackets or anywhere in text."""
-#     if not s:
-#         return ""
-#     m = re.search(r"\[([0-9A-Fa-f]{6,})\]", s)
-#     if m:
-#         return m.group(1).upper()
-#     m2 = SERIAL_RE.search(s)
-#     return m2.group(1).upper() if m2 else ""
 
 def key_for_alert_message(msg: str) -> str:
     """Stable key for dedupe / repeat-suppression: prefer serial, else prefix text."""
@@ -99,18 +65,6 @@ def key_for_alert_message(msg: str) -> str:
         return ser
     # fallback to prefix before ':' normalized
     return (msg.split(":", 1)[0].strip().upper()) if ":" in msg else msg.strip().upper()
-
-# ---------------- CONFIG LOADING ----------------
-
-# def load_config(path="monitor_inverters.conf"):
-#     """Read configuration from INI file using configparser."""
-#     parser = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
-#     parser.optionxform = str  # preserve case
-#     if not os.path.exists(path):
-#         print(f"⚠️ Config file not found: {path}", file=sys.stderr)
-#         sys.exit(1)
-#     parser.read(path)
-#     return parser
 
 # ---------------- UTILITIES ----------------
 def load_optimizer_expectations():
@@ -191,17 +145,6 @@ def solar_window(dt_local):
     sunset = s["sunset"] - EVENING_GRACE
     return (sunrise <= dt_local <= sunset, sunrise, sunset)
 
-# def scaled(values, name):
-#     """Return scaled numeric value (applies *_scale if present)."""
-#     if name not in values:
-#         return None
-#     raw = values.get(name)
-#     scale = 10 ** values.get(f"{name}_scale", 0)
-#     try:
-#         return float(raw) * float(scale)
-#     except Exception:
-#         return None
-
 def status_text(code: int) -> str:
     """Return descriptive status name."""
     explicit = {
@@ -215,45 +158,6 @@ def status_text(code: int) -> str:
         8: "Standby",
     }
     return explicit.get(code, f"Unknown({code})")
-
-# def read_inverter(inv, verbose=False):
-#     """Read key metrics from one inverter."""
-#     try:
-#         socket.gethostbyname(inv["host"])
-#         inverter = solaredge_modbus.Inverter(
-#             host=inv["host"],
-#             port=inv["port"],
-#             timeout=MODBUS_TIMEOUT,
-#             retries=MODBUS_RETRIES,
-#             unit=inv["unit"],
-#         )
-#         v = inverter.read_all()
-#     except (socket.error, OSError, Exception) as e:
-#         if verbose:
-#             print(f"[{inv['name']}] ERROR reading inverter: {e}", file=sys.stderr)
-#         # Ensure returned dict always contains the configured `name` field
-#         # so downstream code (simulation/selection) can safely reference it.
-#         return {"name": inv["name"], "id": inv["name"], "model": None, "serial": None, "error": True}
-
-#     model = v.get("c_model") or v.get("model")
-#     serial = v.get("c_serialnumber") or v.get("serialnumber")
-#     id_str = inv_display_from_parts(model, serial)
-
-#     return {
-#         "name": inv["name"],     # configured nickname
-#         "id": id_str,            # canonical visible identity
-#         "model": model,
-#         "serial": clean_serial(serial),
-#         "status": v.get("status"),
-#         "vendor_status": v.get("vendor_status"),
-#         "pac_W": scaled(v, "power_ac"),
-#         "vdc_V": scaled(v, "voltage_dc"),
-#         "idc_A": scaled(v, "current_dc"),
-#         "temp_C": scaled(v, "temperature"),
-#         "freq_Hz": scaled(v, "frequency"),
-#         "e_total_Wh": scaled(v, "energy_total") or scaled(v, "total_energy"),
-#         "raw": v,
-#     }
 
 # ---------------- ALERT REPETITION CONTROL ----------------
 
@@ -545,6 +449,18 @@ def main():
     SOLAREDGE_API_KEY = cfg.api.api_key
     SOLAREDGE_SITE_ID = cfg.api.site_id
 
+    # Instantiate SolarEdge API checker (Stage 4.1)
+    total_expected, expected_by_serial = load_optimizer_expectations()
+
+    api_checker = SolarEdgeAPIChecker(
+        api_key=SOLAREDGE_API_KEY,
+        site_id=SOLAREDGE_SITE_ID,
+        optimizer_expected_total=total_expected,
+        optimizer_expected_per_inv=expected_by_serial,
+        debug=args.debug,
+    )
+
+
     # Daily Summary
     DAILY_SUMMARY_ENABLED = cfg.alerts.daily_enabled
     DAILY_SUMMARY_METHOD = cfg.alerts.daily_method
@@ -695,195 +611,9 @@ def main():
                 log(f"Night window ({reason}): skipping checks.")
             return 0
 
-    # ---------------- DETECTION ----------------
-    # def detect_anomalies(results):
-    #     """Return list of alert strings based on status and power rules."""
-    #     alerts = []
-    #     for r in results:
-    #         st, st_txt = r["status"], status_text(r["status"])
-    #         pac, vdc, idc = r["pac_W"], r["vdc_V"], r["idc_A"]
-
-    #         # Skip production/safety checks at night
-    #         if not is_day:
-    #             continue
-
-    #         if st not in (2, 4):
-    #             alerts.append(f"{r['id']}: Abnormal status ({st_txt})")
-
-    #         if vdc is not None and idc is not None:
-    #             if abs(idc) <= ZERO_CURRENT_EPS and vdc < SAFE_DC_VOLT_MAX:
-    #                 alerts.append(
-    #                     f"{r['id']}: SafeDC/open-DC suspected "
-    #                     f"(Vdc={vdc:.1f}V, Idc≈0A, status={st_txt})"
-    #                 )
-
-    #         if pac is not None and pac < ABS_MIN_WATTS and st == 4:
-    #             alerts.append(
-    #                 f"{r['id']}: Low production "
-    #                 f"(PAC={pac:.0f}W < {ABS_MIN_WATTS:.0f}W, status={st_txt})"
-    #             )
-
-    #     if PEER_COMPARE and len(results) >= 2:
-    #         pacs = [r["pac_W"] for r in results if r["pac_W"] is not None]
-    #         if pacs and max(pacs) >= PEER_MIN_WATTS:
-    #             med = sorted(pacs)[len(pacs) // 2]
-    #             threshold = max(med * PEER_LOW_RATIO, ABS_MIN_WATTS)
-    #             for r in results:
-    #                 pac = r["pac_W"]
-    #                 if pac is None:
-    #                     continue
-    #                 if pac < threshold:
-    #                     alerts.append(
-    #                         f"{r['id']}: Under peer median "
-    #                         f"(PAC={pac:.0f}W < {threshold:.0f}W, peers median≈{med:.0f}W)"
-    #                     )
-
-    #     # Merge duplicate keys for cleaner output (within Modbus-generated alerts)
-    #     merged = {}
-    #     for msg in alerts:
-    #         key = extract_serial_from_text(msg) or msg.split(":", 1)[0].strip().upper()
-    #         merged.setdefault(key, []).append(msg)
-    #     out = []
-    #     for k, msgs in merged.items():
-    #         if len(msgs) == 1:
-    #             out.append(msgs[0])
-    #         else:
-    #             out.append(f"{msgs[0].split(':',1)[0]}: " + " | ".join(m.split(": ", 1)[1] for m in msgs))
-    #     return out
-
-    # ---------------- SOLAREDGE API CHECK ----------------
-    def check_solaredge_api(modbus_results):
-        """Fetch inverter and optimizer data from the SolarEdge Cloud API."""
-        if not ENABLE_SOLAREDGE_API:
-            return []
-        if not SOLAREDGE_API_KEY or not SOLAREDGE_SITE_ID:
-            return ["SolarEdge API not configured (missing SOLAREDGE_SITE_ID or SOLAREDGE_API_KEY)"]
-
-        base_url = "https://monitoringapi.solaredge.com"
-        session = requests.Session()
-        alerts = []
-        total_expected, expected_by_serial = load_optimizer_expectations()
-
-        # Build Modbus serial→modelbase map for consistent display in API alerts
-        serial_to_modelbase = {}
-        for r in (m for m in modbus_results if not m.get("error")):
-            serial_to_modelbase[clean_serial(r.get("serial"))] = model_base(r.get("model"))
-
-        # --- (A) Equipment list ---
-        try:
-            eq_url = f"{base_url}/equipment/{SOLAREDGE_SITE_ID}/list?api_key={SOLAREDGE_API_KEY}"
-            resp = session.get(eq_url, timeout=15)
-            resp.raise_for_status()
-            eq_list = resp.json().get("reporters", {}).get("list", [])
-            if args.debug:
-                print(f"[DEBUG] (api) Equipment list: {len(eq_list)} devices retrieved")
-        except Exception as e:
-            return [f"SolarEdge API equipment list error: {e}"]
-
-        # --- (B) Inverter telemetry ---
-        now = dt.datetime.now()
-        start = now - timedelta(hours=1)
-        end = now
-
-        for e in eq_list:
-            serial = clean_serial(e.get("serialNumber"))
-            if not serial:
-                continue
-            mb = serial_to_modelbase.get(serial, "")  # prefer Modbus model base
-            display = inv_display_from_parts(mb, serial)
-
-            params = {
-                "startTime": start.strftime("%Y-%m-%d %H:%M:%S"),
-                "endTime": end.strftime("%Y-%m-%d %H:%M:%S"),
-                "api_key": SOLAREDGE_API_KEY,
-            }
-            try:
-                url = f"{base_url}/equipment/{SOLAREDGE_SITE_ID}/{serial}/data"
-                r = session.get(url, params=params, timeout=20)
-                r.raise_for_status()
-                tele = r.json().get("data", {}).get("telemetries", [])
-                if not tele:
-                    alerts.append(f"{display}: no telemetry data in past hour")
-                    if args.debug:
-                        print(f"[DEBUG] (api) {display}: no telemetry in {start:%H:%M}–{end:%H:%M}")
-                    continue
-
-                latest = tele[-1]
-                pac = latest.get("totalActivePower", 0.0)
-                vdc = latest.get("dcVoltage")
-                mode = latest.get("inverterMode", "UNKNOWN")
-                ts = latest.get("date")
-
-                if args.debug:
-                    print(f"[DEBUG] (api) {display}: {pac:.1f} W, {vdc} Vdc, mode={mode}, time={ts}")
-
-                if mode in ("FAULT", "OFF"):
-                    alerts.append(f"{display}: inverterMode={mode} (API time {ts})")
-                elif pac == 0 and vdc and vdc > 50:
-                    alerts.append(f"{display}: 0 W output with DC present (API time {ts})")
-
-            except Exception as ex:
-                alerts.append(f"{display}: failed to read inverter data ({ex})")
-                if args.debug:
-                    print(f"[DEBUG] (api) {display}: telemetry request failed → {ex}")
-
-        # --- (C) Optimizer connectivity (from /site/.../inventory) ---
-        try:
-            inv_url = f"{base_url}/site/{SOLAREDGE_SITE_ID}/inventory?api_key={SOLAREDGE_API_KEY}"
-            inv_resp = session.get(inv_url, timeout=15)
-            inv_resp.raise_for_status()
-            inv_json = inv_resp.json()
-            if args.debug:
-                print(f"[DEBUG] (api) Inventory query OK, keys: {list(inv_json.keys())}")
-        except Exception as e:
-            alerts.append(f"Inventory read error: {e}")
-            return alerts
-
-        inverters = inv_json.get("Inventory", {}).get("inverters", []) or []
-        per_serial_counts = {}
-        total_connected = 0
-
-        for inv in inverters:
-            serial_raw = inv.get("serialNumber") or inv.get("SN") or ""
-            serial = clean_serial(serial_raw)
-            mb = serial_to_modelbase.get(serial, "")
-            display = inv_display_from_parts(mb, serial)
-            count = inv.get("connectedOptimizers")
-            try:
-                count = int(count) if count is not None else 0
-            except Exception:
-                count = 0
-            per_serial_counts[serial] = count
-            total_connected += count
-            if args.debug:
-                print(f"[DEBUG] (api) {display}: {count} optimizers connected")
-
-        if args.debug:
-            print(f"[DEBUG] (api) Total optimizers connected: {total_connected}")
-
-        # --- (D) Compare against expected counts ---
-        if isinstance(total_expected, int) and total_connected < total_expected:
-            alerts.append(f"Optimizers: {total_connected} connected < expected {total_expected} (total)")
-
-        # --- (E) Compare against expected counts per inverter (normalized serials) ---
-        for exp_serial, expected in expected_by_serial.items():
-            s = clean_serial(exp_serial)
-            actual = per_serial_counts.get(s)
-            display = inv_display_from_parts(serial_to_modelbase.get(s, ""), s)
-            if actual is None:
-                if args.debug:
-                    print(f"[DEBUG] No optimizer data match for expected serial {s}")
-                if total_connected == 0:
-                    alerts.append(f"{display}: optimizer count unavailable")
-            elif actual < expected:
-                alerts.append(f"{display}: {actual} optimizers < expected {expected}")
-
-        return alerts
-
 
     read_ok = [r for r in results if not r.get("error")]
     alerts = detector.detect(read_ok, is_day=is_day)
-
 
     # Track and notify recoveries ---
     recoveries = update_inverter_states(read_ok)
@@ -897,7 +627,8 @@ def main():
             alerts.append(f"{display}: Modbus read failed")
 
     # Cloud API checks
-    cloud_alerts = check_solaredge_api(read_ok)
+    cloud_alerts = api_checker.check(read_ok)
+
     if cloud_alerts:
         log("Cloud API Alerts:")
         for a in cloud_alerts:
