@@ -566,7 +566,7 @@ def main():
             if not r.get("error"):
                 any_success = True
                 if args.verbose and not args.quiet:
-                    log(f"[{r['id']}] PAC={r['pac_W']:.0f}W Vdc={r['vdc_V']:.1f}V "
+                    log(f"[{r['id']}] (modbus) PAC={r['pac_W']:.0f}W Vdc={r['vdc_V']:.1f}V "
                         f"Idc={r['idc_A']:.2f}A status={status_text(r['status'])}")
 
 
@@ -717,7 +717,7 @@ def main():
             resp.raise_for_status()
             eq_list = resp.json().get("reporters", {}).get("list", [])
             if args.debug:
-                print(f"[DEBUG] Equipment list: {len(eq_list)} devices retrieved")
+                print(f"[DEBUG] (api) Equipment list: {len(eq_list)} devices retrieved")
         except Exception as e:
             return [f"SolarEdge API equipment list error: {e}"]
 
@@ -746,7 +746,7 @@ def main():
                 if not tele:
                     alerts.append(f"{display}: no telemetry data in past hour")
                     if args.debug:
-                        print(f"[DEBUG] {display}: no telemetry in {start:%H:%M}–{end:%H:%M}")
+                        print(f"[DEBUG] (api) {display}: no telemetry in {start:%H:%M}–{end:%H:%M}")
                     continue
 
                 latest = tele[-1]
@@ -756,7 +756,7 @@ def main():
                 ts = latest.get("date")
 
                 if args.debug:
-                    print(f"[DEBUG] {display}: {pac:.1f} W, {vdc} Vdc, mode={mode}, time={ts}")
+                    print(f"[DEBUG] (api) {display}: {pac:.1f} W, {vdc} Vdc, mode={mode}, time={ts}")
 
                 if mode in ("FAULT", "OFF"):
                     alerts.append(f"{display}: inverterMode={mode} (API time {ts})")
@@ -766,7 +766,7 @@ def main():
             except Exception as ex:
                 alerts.append(f"{display}: failed to read inverter data ({ex})")
                 if args.debug:
-                    print(f"[DEBUG] {display}: telemetry request failed → {ex}")
+                    print(f"[DEBUG] (api) {display}: telemetry request failed → {ex}")
 
         # --- (C) Optimizer connectivity (from /site/.../inventory) ---
         try:
@@ -775,7 +775,7 @@ def main():
             inv_resp.raise_for_status()
             inv_json = inv_resp.json()
             if args.debug:
-                print(f"[DEBUG] Inventory query OK, keys: {list(inv_json.keys())}")
+                print(f"[DEBUG] (api) Inventory query OK, keys: {list(inv_json.keys())}")
         except Exception as e:
             alerts.append(f"Inventory read error: {e}")
             return alerts
@@ -797,10 +797,10 @@ def main():
             per_serial_counts[serial] = count
             total_connected += count
             if args.debug:
-                print(f"[DEBUG] {display}: {count} optimizers connected")
+                print(f"[DEBUG] (api) {display}: {count} optimizers connected")
 
         if args.debug:
-            print(f"[DEBUG] Total optimizers connected: {total_connected}")
+            print(f"[DEBUG] (api) Total optimizers connected: {total_connected}")
 
         # --- (D) Compare against expected counts ---
         if isinstance(total_expected, int) and total_connected < total_expected:
@@ -820,6 +820,7 @@ def main():
                 alerts.append(f"{display}: {actual} optimizers < expected {expected}")
 
         return alerts
+
 
     read_ok = [r for r in results if not r.get("error")]
     alerts = detect_anomalies(read_ok)
