@@ -12,27 +12,16 @@ SolarEdge inverter monitor via Modbus TCP + optional Cloud API
 - Supports --quiet for cron-friendly output
 """
 
-import os
 import sys
 import json
-#import socket
-import time
-import urllib.request
-import urllib.parse
-import urllib.error
 import pytz
-# import configparser
-# import solaredge_modbus
 from astral import LocationInfo
 from astral.sun import sun
-import requests
-#import datetime as dt
 from datetime import datetime, timedelta
 import argparse
 from argparse import RawTextHelpFormatter
 from urllib.parse import urlparse, urlunparse, urlencode
 from concurrent.futures import ThreadPoolExecutor, as_completed
-#import re
 from pathlib import Path
 import importlib.util
 
@@ -80,70 +69,6 @@ def solar_window(dt_local, astral_loc, morning_grace, evening_grace):
     sunrise = s["sunrise"] + morning_grace
     sunset = s["sunset"] - evening_grace
     return (sunrise <= dt_local <= sunset, sunrise, sunset)
-
-# ---------------- ALERT REPETITION CONTROL ----------------
-
-
-# def load_alert_state():
-#     global _ALERT_STATE_CACHE
-#     if _ALERT_STATE_CACHE is not None:
-#         return _ALERT_STATE_CACHE
-#     try:
-#         with open(ALERT_STATE_FILE, "r") as f:
-#             _ALERT_STATE_CACHE = json.load(f)
-#     except Exception:
-#         _ALERT_STATE_CACHE = {}
-#     return _ALERT_STATE_CACHE
-
-# def save_alert_state(state):
-#     try:
-#         with open(ALERT_STATE_FILE, "w") as f:
-#             json.dump(state, f)
-#     except Exception as e:
-#         print(f"⚠️ Failed to save alert state: {e}", file=sys.stderr)
-
-# def should_alert(key_text):
-#     """Return True if alert for 'key_text' should be triggered now (after X/Y rule)."""
-#     serial = clean_serial(key_text)
-#     key = serial if serial else key_text.strip().upper()
-#     state = load_alert_state()
-#     now = time.time()
-
-#     record = state.get(key) or {}
-#     first_ts = record.get("first", now)
-#     count = record.get("count", 0)
-
-#     # reset window if expired or malformed
-#     if not isinstance(first_ts, (int, float)) or now - first_ts > ALERT_REPEAT_WINDOW_MIN * 60:
-#         first_ts = now
-#         count = 0
-
-#     count += 1
-#     record.update({"first": first_ts, "count": count})
-#     state[key] = record
-#     save_alert_state(state)
-
-#     return count >= ALERT_REPEAT_COUNT
-
-
-# # ---------------- RECOVERY TRACKING ----------------
-# def update_inverter_states(results, notifier):
-#     """Track inverter mode transitions and issue recovery notifications."""
-#     state = load_alert_state()
-#     recoveries = []
-#     for r in results:
-#         key_display = inv_display_from_parts(r.get("model"), r.get("serial"))
-#         key_state = clean_serial(r.get("serial")) or key_display.upper()
-#         st_txt = status_human(r.get("status", 0))
-#         last_mode = state.get(key_state, {}).get("last_mode")
-#         if last_mode in ("Fault", "Off") and st_txt == "Producing":
-#             msg = f"{key_display}: recovered from {last_mode} → Producing"
-#             recoveries.append(msg)
-#             notifier.send("SolarEdge Recovery", msg, priority=0)
-#         state.setdefault(key_state, {})["last_mode"] = st_txt
-#     save_alert_state(state)
-#     return recoveries
-
 
 # ---------------- SIMULATION CONSTANTS ----------------
 SIMULATED_NORMAL = {"status": 4, "pac_W": 5000.0, "vdc_V": 380.0, "idc_A": 13.0}
@@ -268,11 +193,6 @@ def main():
     )
 
     health = Healthchecks(HEALTHCHECKS_URL)
-
-    # Cloud API
-    # ENABLE_SOLAREDGE_API = cfg.api.enabled
-    # SOLAREDGE_API_KEY = cfg.api.api_key
-    # SOLAREDGE_SITE_ID = cfg.api.site_id
 
     # Daily Summary
     DAILY_SUMMARY_ENABLED = cfg.alerts.daily_enabled
