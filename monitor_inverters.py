@@ -33,6 +33,7 @@ from solaredge_api_checker import SolarEdgeAPIChecker
 from daily_summary import DailySummaryManager, DailySummaryConfig
 from notifiers import Notifier, Healthchecks
 from alert_state import AlertStateManager, AlertStateConfig
+from simulation import SimulationEngine
 
 from utils import (
     clean_serial,
@@ -69,9 +70,6 @@ def solar_window(dt_local, astral_loc, morning_grace, evening_grace):
     sunrise = s["sunrise"] + morning_grace
     sunset = s["sunset"] - evening_grace
     return (sunrise <= dt_local <= sunset, sunrise, sunset)
-
-# ---------------- SIMULATION CONSTANTS ----------------
-SIMULATED_NORMAL = {"status": 4, "pac_W": 5000.0, "vdc_V": 380.0, "idc_A": 13.0}
 
 # ---------------- CLI ARGUMENTS ----------------
 def build_arg_parser():
@@ -134,6 +132,9 @@ def main():
     # Load config using our new class
     cfg = ConfigManager(args.config or "monitor_inverters.conf")
 
+    # Simulation engine now needs both mode and optional target name
+    sim = SimulationEngine(args.simulate, args.simulate_target)
+
     # Site / Astral
     CITY_NAME = cfg.site.city_name
     LAT = cfg.site.lat
@@ -164,7 +165,6 @@ def main():
     )
 
     alert_mgr = AlertStateManager(state_cfg, debug=args.debug)
-
 
     # Detection engine (Stage 3)
     detector = AnomalyDetector(
@@ -266,57 +266,20 @@ def main():
         EVENING_GRACE,
     )
 
+    # Simulation: always treat as day if active
+    is_day = sim.override_daylight(is_day)
+
+
     if args.verbose and not args.quiet:
         log(f"[time] now={dt_local.strftime('%Y-%m-%d %H:%M:%S %Z')} day={is_day} "
             f"sunrise+grace={sunrise.strftime('%H:%M')} sunset-grace={sunset.strftime('%H:%M')}")
 
     results, any_success = reader.read_all(INVERTERS, verbose=args.verbose, quiet=args.quiet)
 
-    # --- Simulation injection ---
-    simulation_info = None
-    if args.simulate != "off" and results:
-        target = None
-        if args.simulate_target:
-            for r in results:
-                if r.get("name") == args.simulate_target:
-                    target = r
-                    break
-            if target is None:
-                log(f"⚠️ No inverter found with name '{args.simulate_target}', using first available inverter instead.")
-                # prefer a non-error candidate if possible
-                target = next((x for x in results if not x.get("error") and x.get("name")), results[0])
-        else:
-            # Default: lowest kW model
-            def extract_kw(inv):
-                import re
-                model = inv.get("model") or inv.get("name", "")
-                m = re.search(r"(\d{4,5})", model)
-                return int(m.group(1)) if m else 99999
-            candidates = [r for r in results if not r.get("error")]
-            if not candidates:
-                candidates = results
-            target = min(candidates, key=extract_kw)
+    # --- Simulation overrides applied to inverter results ---
+    simulation_info = sim.apply_to_results(results, log, verbose=args.verbose)
 
-        log(f"🔧 Simulating inverter '{target['name']}' in mode '{args.simulate}'")
-        simulation_info = f"{args.simulate} on {target['name']}"
 
-        for r in results:
-            if r is target:
-                continue
-            if not r.get("error"):
-                r.update(SIMULATED_NORMAL)
-                if args.verbose:
-                    log(f"(Simulation) {r['id']} simulating normal output")
-
-        if args.simulate == "low":
-            target.update({"pac_W": 0.0, "status": 4})
-            log(f"(Simulation) {target['id']} simulating 0W output")
-        elif args.simulate == "fault":
-            target["status"] = 7
-            log(f"(Simulation) {target['id']} simulating FAULT state")
-        elif args.simulate == "offline":
-            target["error"] = True
-            log(f"(Simulation) {target['id']} simulating unreachable state")
 
     # --- JSON output ---
     if args.json:
