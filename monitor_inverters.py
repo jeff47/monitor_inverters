@@ -34,6 +34,8 @@ from daily_summary import DailySummaryManager, DailySummaryConfig
 from notifiers import Notifier, Healthchecks
 from alert_state import AlertStateManager, AlertStateConfig
 from simulation import SimulationEngine
+from output_formats import json_output
+
 
 from utils import (
     clean_serial,
@@ -279,14 +281,9 @@ def main():
     # --- Simulation overrides applied to inverter results ---
     simulation_info = sim.apply_to_results(results, log, verbose=args.verbose)
 
-
-
     # --- JSON output ---
     if args.json:
-        out = {"results": results, "timestamp": dt_local.isoformat()}
-        if simulation_info:
-            out["simulation"] = simulation_info
-        print(json.dumps(out, indent=2, default=str))
+        print(json_output(results, dt_local, simulation_info))
         return 0
 
     if not any_success:
