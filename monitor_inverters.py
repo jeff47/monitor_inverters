@@ -68,74 +68,6 @@ def key_for_alert_message(msg: str) -> str:
     return (msg.split(":", 1)[0].strip().upper()) if ":" in msg else msg.strip().upper()
 
 # ---------------- UTILITIES ----------------
-def load_optimizer_expectations():
-    """
-    Reads [optimizers] section.
-    - TOTAL_EXPECTED (int): optional
-    - Other keys are inverter serial numbers with expected optimizer counts.
-    """
-    total_expected = None
-    per_inv_expected = {}
-
-    parser = cfg.parser
-
-    if parser.has_section("optimizers"):
-        for key, val in parser.items("optimizers"):
-            key_up = key.strip().upper()
-            try:
-                count = int(str(val).strip())
-            except Exception:
-                continue
-            if key_up == "TOTAL_EXPECTED":
-                total_expected = count
-            else:
-                per_inv_expected[clean_serial(key_up)] = count
-
-    return total_expected, per_inv_expected
-
-# def pushover_notify(title: str, message: str, priority: int = 0):
-#     """Send a Pushover notification if credentials are configured."""
-#     user_key = (PUSHOVER_USER_KEY or "").strip()
-#     api_token = (PUSHOVER_API_TOKEN or "").strip()
-#     if not user_key and not api_token:
-#         if os.environ.get("DEBUG"):
-#             print("ℹ️  Pushover disabled (no credentials configured).", file=sys.stderr)
-#         return
-#     if bool(user_key) != bool(api_token):
-#         raise RuntimeError("Configuration error: Both PUSHOVER_USER_KEY and PUSHOVER_API_TOKEN must be set for Pushover.")
-#     data = urlencode({
-#         "token": api_token,
-#         "user": user_key,
-#         "title": title,
-#         "message": message,
-#         "priority": str(priority),
-#     }).encode("utf-8")
-#     try:
-#         req = urllib.request.Request("https://api.pushover.net/1/messages.json", data=data)
-#         urllib.request.urlopen(req, timeout=10)
-#     except Exception as e:
-#         print(f"⚠️ Failed to send Pushover alert: {e}", file=sys.stderr)
-
-# def ping_healthcheck(status: str, message: str = ""):
-#     """Ping Healthchecks.io with optional status message."""
-#     if not HEALTHCHECKS_URL:
-#         if os.environ.get("DEBUG"):
-#             print("ℹ️  Healthchecks disabled (no URL configured).", file=sys.stderr)
-#         return
-#     url = HEALTHCHECKS_URL.rstrip("/")
-#     if status == "fail":
-#         url += "/fail"
-#     parsed = list(urlparse(url))
-#     query = {}
-#     if message:
-#         query["msg"] = message[:200]
-#     parsed[4] = urlencode(query)
-#     full_url = urlunparse(parsed)
-#     try:
-#         urllib.request.urlopen(full_url, timeout=5)
-#     except urllib.error.URLError as e:
-#         print(f"⚠️ Failed to ping Healthchecks.io: {e}", file=sys.stderr)
-
 def now_local(tzname: str):
     """Pure: return current datetime in the given timezone."""
     return datetime.now(pytz.timezone(tzname))
@@ -225,97 +157,6 @@ def update_inverter_states(results, notifier):
     save_alert_state(state)
     return recoveries
 
-# ---------------- DAILY SUMMARY ----------------
-# def _fetch_site_daily_kwh_api():
-#     """Return dict {"site_total": kWh} for today using SolarEdge API, with verbose debug."""
-#     if not (ENABLE_SOLAREDGE_API and SOLAREDGE_API_KEY and SOLAREDGE_SITE_ID):
-#         print("🔍 [DEBUG] API disabled or missing key/site id.")
-#         return None
-#     base = "https://monitoringapi.solaredge.com"
-#     session = requests.Session()
-#     today = datetime.now().strftime("%Y-%m-%d")
-#     params = {
-#         "timeUnit": "DAY",
-#         "startDate": today,
-#         "endDate": today,
-#         "api_key": SOLAREDGE_API_KEY,
-#     }
-#     url = f"{base}/site/{SOLAREDGE_SITE_ID}/energy"
-#     try:
-#         r = session.get(url, params=params, timeout=20)
-#         if r.status_code != 200:
-#             print("⚠️ [DEBUG] Non-200 from API; aborting site energy fetch.")
-#             return None
-#         j = r.json()
-#         energy = j.get("energy", {})
-#         values = energy.get("values", [])
-#         if not values:
-#             return None
-#         first = values[0]
-#         total_Wh = first.get("value")
-#         if total_Wh is None:
-#             return None
-#         total_kWh = round(float(total_Wh) / 1000.0, 2)
-#         return {"site_total": total_kWh}
-#     except Exception as e:
-#         print(f"⚠️ [DEBUG] Exception in _fetch_site_daily_kwh_api: {e}", file=sys.stderr)
-#         return None
-
-# def _compute_per_inverter_daily_kwh_modbus(results):
-#     """Compute per-inverter kWh for today from lifetime Wh deltas."""
-#     state = load_alert_state()
-#     date_str = now_local().strftime("%Y-%m-%d")
-#     totals = {}
-#     for r in results:
-#         key_display = inv_display_from_parts(r.get("model"), r.get("serial"))
-#         key_state = f"{clean_serial(r.get('serial')) or key_display.upper()}:{date_str}"
-#         e_total_Wh = r.get("e_total_Wh")
-#         if e_total_Wh is None:
-#             continue
-#         energy_state = state.setdefault("energy", {})
-#         baseline = energy_state.get(key_state)
-#         if baseline is None:
-#             energy_state[key_state] = e_total_Wh
-#             delta_Wh = 0.0
-#         else:
-#             delta_Wh = max(0.0, e_total_Wh - float(baseline))
-#         totals[key_display] = round(delta_Wh / 1000.0, 2)
-#     save_alert_state(state)
-#     return totals
-
-# def maybe_send_daily_summary(results):
-#     """Send once-per-day summary at (sunset + DAILY_SUMMARY_OFFSET_MIN) or immediately if forced."""
-#     if not DAILY_SUMMARY_ENABLED:
-#         return
-#     dt_local = now_local()
-#     date_str = dt_local.strftime("%Y-%m-%d")
-#     state = load_alert_state()
-#     last = state.get("daily_summary", {})
-#     forced = "--force-summary" in sys.argv
-#     if not forced:
-#         if last.get("date") == date_str and last.get("sent"):
-#             return
-#         _, _, sunset = solar_window(dt_local)
-#         trigger_time = sunset + timedelta(minutes=DAILY_SUMMARY_OFFSET_MIN)
-#         if dt_local < trigger_time:
-#             return
-#     per_inv = None
-#     if DAILY_SUMMARY_METHOD == "api":
-#         per_inv = _fetch_site_daily_kwh_api()
-#     if per_inv is None:
-#         print("🔍 [DEBUG] API fetch failed or empty; trying Modbus fallback.")
-#         per_inv = _compute_per_inverter_daily_kwh_modbus(results)
-#     if not per_inv:
-#         print("⚠️ [DEBUG] No daily summary data found; aborting.")
-#         return
-#     total = round(sum(v for v in per_inv.values()), 2)
-#     lines = [f"{n}: {v:.2f} kWh" for n, v in sorted(per_inv.items())]
-#     lines.append(f"Total: {total:.2f} kWh")
-#     msg = "\n".join(lines)
-#     print(msg)
-#     pushover_notify(f"SolarEdge Daily Summary — {date_str}", msg, priority=0)
-#     state["daily_summary"] = {"date": date_str, "sent": True}
-#     save_alert_state(state)
 
 # ---------------- SIMULATION CONSTANTS ----------------
 SIMULATED_NORMAL = {"status": 4, "pac_W": 5000.0, "vdc_V": 380.0, "idc_A": 13.0}
@@ -470,9 +311,19 @@ def main():
         debug=args.debug,
     )
 
-
     # Instantiate SolarEdge API checker (Stage 4.1)
-    total_expected, expected_by_serial = load_optimizer_expectations()
+    # cfg.optimizers is: dict[str, OptimizerExpectation]
+    optimizer_expectations = cfg.optimizers
+
+    # Convert optimizer expectations into the API checker's expected format:
+    #  - expected total: sum of all optimizer counts
+    #  - expected by inverter serial: { "SERIAL": count }
+    total_expected = sum(o.count for o in optimizer_expectations.values()) if optimizer_expectations else None
+
+    expected_by_serial = {
+        clean_serial(serial): o.count
+        for serial, o in optimizer_expectations.items()
+    }
 
     api_checker = SolarEdgeAPIChecker(
         api_key=cfg.api.api_key,

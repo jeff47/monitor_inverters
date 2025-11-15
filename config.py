@@ -5,6 +5,11 @@ from pathlib import Path
 from datetime import timedelta
 
 @dataclass
+class OptimizerExpectation:
+    count: int
+    tolerance: int | None = None
+
+@dataclass
 class SiteConfig:
     city_name: str
     lat: float
@@ -69,6 +74,7 @@ class ConfigManager:
         self.alerts = self._load_alerts()
         self.api = self._load_api()
         self.pushover = self._load_pushover()
+        self.optimizers = self._load_optimizers()
 
     @property
     def parser(self):
@@ -152,4 +158,29 @@ class ConfigManager:
             api_token=p.get("pushover", "PUSHOVER_API_TOKEN", fallback=None),
         )
 
+    def _load_optimizers(self) -> dict[str, OptimizerExpectation]:
+        """
+        Load optimizer expected-counts using the legacy simple format:
 
+            [optimizers]
+            SERIAL1 = 19
+            SERIAL2 = 26
+
+        Tolerance is not used; OptimizerExpectation.tolerance is always None.
+        """
+        p = self._raw
+        optimizers: dict[str, OptimizerExpectation] = {}
+
+        if not p.has_section("optimizers"):
+            return optimizers
+
+        for key, val in p.items("optimizers"):
+            key = key.strip()
+            try:
+                count = int(str(val).strip())
+            except ValueError:
+                continue  # ignore malformed/invalid entries
+
+            optimizers[key] = OptimizerExpectation(count=count, tolerance=None)
+
+        return optimizers
