@@ -230,15 +230,7 @@ def main():
     ASTRAL_LOC = LocationInfo(CITY_NAME, "USA", TZNAME, LAT, LON)
 
     # Inverters
-    INVERTERS = [
-        {
-            "name": inv_cfg.name,
-            "host": inv_cfg.host,
-            "port": inv_cfg.port,
-            "unit": inv_cfg.unit,
-        }
-        for inv_cfg in cfg.inverters
-    ]
+    INVERTERS = cfg.inverters
 
     # Thresholds
     MORNING_GRACE = cfg.thresholds.morning_grace
@@ -315,11 +307,6 @@ def main():
     # cfg.optimizers is: dict[str, OptimizerExpectation]
     optimizer_expectations = cfg.optimizers
 
-    # Convert optimizer expectations into the API checker's expected format:
-    #  - expected total: sum of all optimizer counts
-    #  - expected by inverter serial: { "SERIAL": count }
-    total_expected = sum(o.count for o in optimizer_expectations.values()) if optimizer_expectations else None
-
     expected_by_serial = {
         clean_serial(serial): o.count
         for serial, o in optimizer_expectations.items()
@@ -328,12 +315,9 @@ def main():
     api_checker = SolarEdgeAPIChecker(
         api_key=cfg.api.api_key,
         site_id=cfg.api.site_id,
-        optimizer_expected_total=total_expected,
         optimizer_expected_per_inv=expected_by_serial,
         debug=args.debug,
     )
-
-
 
     reader = InverterReader(
         ReaderSettings(
@@ -379,12 +363,13 @@ def main():
     with ThreadPoolExecutor(max_workers=min(8, len(INVERTERS) or 1)) as executor:
         futures = {executor.submit(reader.read_one, inv): inv for inv in INVERTERS}
         for future in as_completed(futures):
-            inv = futures[future]
+            inv = futures[future]  # inv is an InverterConfig now
             try:
                 r = future.result()
             except Exception as e:
-                r = {"id": inv["name"], "error": True}
-                print(f"[{inv['name']}] Threaded read exception: {e}", file=sys.stderr)
+                # Make sure we include name so simulate_target and logging still work
+                r = {"id": inv.name, "name": inv.name, "error": True}
+                print(f"[{inv.name}] Threaded read exception: {e}", file=sys.stderr)
             results.append(r)
             if not r.get("error"):
                 any_success = True
@@ -392,11 +377,12 @@ def main():
                     pac = r.get("pac_W")
                     vdc = r.get("vdc_V")
                     idc = r.get("idc_A")
-                    status = status_text(r.get("status"))
+                    status = r.get("status")
                     pac_s = f"{pac:.0f}W" if isinstance(pac, (int, float)) else "N/A"
                     vdc_s = f"{vdc:.1f}V" if isinstance(vdc, (int, float)) else "N/A"
                     idc_s = f"{idc:.2f}A" if isinstance(idc, (int, float)) else "N/A"
                     log(f"[{r['id']}] (modbus) PAC={pac_s} Vdc={vdc_s} Idc={idc_s} status={status}")
+
 
     # --- Simulation injection ---
     simulation_info = None

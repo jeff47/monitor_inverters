@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Any, Optional
 import requests
 import time
+import sys
 
 from utils import clean_serial, inv_display_from_parts
 
@@ -30,7 +31,6 @@ API_BASE = "https://monitoringapi.solaredge.com"
 class APICheckerConfig:
     api_key: Optional[str]
     site_id: Optional[str]
-    optimizer_expected_total: Optional[int]
     optimizer_expected_per_inv: Dict[str, int]
     debug: bool = False
 
@@ -40,14 +40,12 @@ class SolarEdgeAPIChecker:
         self,
         api_key: Optional[str],
         site_id: Optional[str],
-        optimizer_expected_total: Optional[int],
         optimizer_expected_per_inv: Dict[str, int],
         debug: bool = False,
     ):
         self.cfg = APICheckerConfig(
             api_key=api_key,
             site_id=site_id,
-            optimizer_expected_total=optimizer_expected_total,
             optimizer_expected_per_inv=optimizer_expected_per_inv or {},
             debug=debug,
         )
@@ -184,17 +182,25 @@ class SolarEdgeAPIChecker:
 
         cloud_by_serial = {}
         for c in cloud_invs:
-            ser = clean_serial(c.get("serialNumber"))
+            raw_ser = (
+                c.get("serialNumber")
+                or c.get("SN")
+                or c.get("serial_number")
+                or c.get("serial")
+                or c.get("DEVICE_SN")
+            )
+            ser = clean_serial(raw_ser)
             if ser:
                 cloud_by_serial[ser] = c
 
+
         # --------------------------------------------------------------
-        # 2. Check optimizer counts if expectations exist
+        # 2. Check optimizer counts if expectations exist (per-inverter only)
         # --------------------------------------------------------------
-        exp_total = self.cfg.optimizer_expected_total
         exp_per_inv = self.cfg.optimizer_expected_per_inv
 
-        if exp_total or exp_per_inv:
+        # Only bother calling the API if we actually have expectations
+        if exp_per_inv:
             opt_counts = self._fetch_optimizer_counts()
         else:
             opt_counts = None
@@ -207,15 +213,6 @@ class SolarEdgeAPIChecker:
                     alerts.append(
                         f"[{ser}] Cloud: optimizer count mismatch "
                         f"(expected {expected}, got {actual})"
-                    )
-
-            # Total expected optimizer count
-            if exp_total is not None:
-                total_actual = sum(opt_counts.values())
-                if total_actual != exp_total:
-                    alerts.append(
-                        f"Cloud: total optimizer count mismatch "
-                        f"(expected {exp_total}, got {total_actual})"
                     )
 
         # --------------------------------------------------------------

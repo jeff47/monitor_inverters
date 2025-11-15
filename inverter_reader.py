@@ -4,9 +4,11 @@ from dataclasses import dataclass
 import socket
 from datetime import datetime
 from typing import Any, Dict
+import time
+import sys
 
 import solaredge_modbus
-
+from config import InverterConfig
 
 # ---------------- IDENTITY HELPERS ----------------
 
@@ -60,50 +62,137 @@ class InverterReader:
         except Exception:
             return None
 
-    def read_one(self, inv_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    def read_one(self, inv: InverterConfig) -> dict:
         """
-        inv_cfg keys:
-          - name
-          - host
-          - port
-          - unit
-        Returns exactly the same dict format used before Stage 2.
+        Read a single inverter using Modbus TCP and return a normalized snapshot dict.
+        Compatible with Jeff47 solaredge_modbus fork (lowercase keys).
         """
-        try:
-            socket.gethostbyname(inv_cfg["host"])
-            inverter = solaredge_modbus.Inverter(
-                host=inv_cfg["host"],
-                port=inv_cfg["port"],
-                timeout=self.settings.timeout,
-                retries=self.settings.retries,
-                unit=inv_cfg["unit"],
-            )
-            v = inverter.read_all()
-        except Exception:
-            return {
-                "name": inv_cfg["name"],
-                "id": inv_cfg["name"],
-                "model": None,
-                "serial": None,
-                "error": True,
-            }
+        from solaredge_modbus import Inverter as SEInverter
 
-        model = v.get("c_model") or v.get("model")
-        serial = v.get("c_serialnumber") or v.get("serialnumber")
-        id_str = inv_display_from_parts(model, serial)
+        host = inv.host
+        port = inv.port
+        unit = inv.unit
 
+        last_exc = None
+
+        # --- Retry loop ---
+        for attempt in range(self.settings.retries):
+            try:
+                dev = SEInverter(host=host, port=port, unit=unit, timeout=self.settings.timeout)
+                try:
+                    dev.connect()
+                    values = dev.read_all()
+                    break
+                finally:
+                    try:
+                        dev.close()
+                    except Exception:
+                        pass
+            except Exception as e:
+                last_exc = e
+                time.sleep(0.05)
+        else:
+            raise RuntimeError(f"Modbus read failed for {inv.name}: {last_exc}")
+
+        # --- Scaling helper ---
+        def _scaled(values, key, scale_key):
+            v = values.get(key)
+            s = values.get(scale_key, 0)
+            if v is None:
+                return None
+            try:
+                return v * (10 ** s)
+            except Exception:
+                return None
+
+        # --- Extract real keys from Jeff-modbus ---
+        model = values.get("c_model", "Unknown")
+        serial = values.get("c_serialnumber", "Unknown")  # the unique device ID
+        raw_status = values.get("status")  # numeric code
+        status = raw_status                # keep internal numeric
+        vendor_status = values.get("vendor_status")
+
+        pac = _scaled(values, "power_ac", "power_ac_scale")
+        vdc = _scaled(values, "voltage_dc", "voltage_dc_scale")
+        idc = _scaled(values, "current_dc", "current_dc_scale")
+        temp = _scaled(values, "temperature", "temperature_scale")
+        freq = _scaled(values, "frequency", "frequency_scale")
+        e_total = _scaled(values, "energy_total", "energy_total_scale")
+
+        # --- Normalized dictionary returned to main ---
         return {
-            "name": inv_cfg["name"],     # configured nickname
-            "id": id_str,                # visible identity
+            "name": inv.name,
+            "id": serial,                  # physical identity of the inverter
             "model": model,
-            "serial": clean_serial(serial),
-            "status": v.get("status"),
-            "vendor_status": v.get("vendor_status"),
-            "pac_W": self._scaled(v, "power_ac"),
-            "vdc_V": self._scaled(v, "voltage_dc"),
-            "idc_A": self._scaled(v, "current_dc"),
-            "temp_C": self._scaled(v, "temperature"),
-            "freq_Hz": self._scaled(v, "frequency"),
-            "e_total_Wh": self._scaled(v, "energy_total") or self._scaled(v, "total_energy"),
-            "raw": v,
+            "serial": serial,
+            "status": status,
+            "vendor_status": vendor_status,
+            "pac_W": pac,
+            "vdc_V": vdc,
+            "idc_A": idc,
+            "temp_C": temp,
+            "freq_Hz": freq,
+            "e_total_Wh": e_total,
+            "raw": values,
+        }
+
+    def read_all(self, inverters: list[InverterConfig], simulate: bool = False) -> list[dict]:
+        """
+        Read all inverters in parallel and return a list of normalized dicts.
+        If simulate=True, produces fake values.
+        """
+
+        # --- Simulation mode ---
+        if simulate:
+            return [self._simulated(inv) for inv in inverters]
+
+        results = []
+
+        # --- Parallel Modbus reads ---
+        with ThreadPoolExecutor(max_workers=len(inverters)) as ex:
+            fut_map = {ex.submit(self.read_one, inv): inv for inv in inverters}
+
+            for fut in as_completed(fut_map):
+                inv = fut_map[fut]
+                try:
+                    snap = fut.result()
+                    results.append(snap)
+                except Exception as e:
+                    # If read_one() failed, provide structured failure
+                    results.append({
+                        "name": inv.name,
+                        "id": None,
+                        "model": None,
+                        "serial": None,
+                        "status": None,
+                        "vendor_status": None,
+                        "pac_W": None,
+                        "vdc_V": None,
+                        "idc_A": None,
+                        "temp_C": None,
+                        "freq_Hz": None,
+                        "e_total_Wh": None,
+                        "raw": None,
+                        "error": str(e),
+                    })
+
+        return results
+
+
+
+    def _simulated(self, inv_cfg):
+        return {
+            "name": inv_cfg["name"],
+            "id": inv_cfg["id"],
+            "model": "SIMULATED",
+            "serial": "SIM12345",
+            "status": "Normal",
+            "vendor_status": "OK",
+            "pac_W": 1234,
+            "vdc_V": 380,
+            "idc_A": 4.1,
+            "temp_C": 45.2,
+            "freq_Hz": 60.01,
+            "e_total_Wh": 999999,
+            "raw": {},
         }
