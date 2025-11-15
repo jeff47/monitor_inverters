@@ -1,4 +1,3 @@
-# daily_summary.py
 """
 DailySummaryManager
 -------------------
@@ -9,17 +8,14 @@ Responsibilities:
   - Fallback to Modbus lifetime-Wh-based calculation
   - Ensure summaries are sent once per day
   - Honor sunset + offset logic
-  - Maintain state in alert_state.json
+  - Maintain state in alert_state through AlertStateManager
 """
 
-from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Optional, List, Any
 from datetime import datetime, timedelta
 import requests
 import pytz
-import json
-import os
 
 from utils import inv_display_from_parts, clean_serial
 
@@ -39,33 +35,16 @@ class DailySummaryManager:
         cfg: DailySummaryConfig,
         astral_loc,
         status_func,
-        state_file: str,
+        state,           # <-- AlertStateManager injected here
         debug: bool = False,
     ):
         self.cfg = cfg
         self.astral_loc = astral_loc
         self.status_func = status_func
-        self.state_file = state_file
+        self.state = state          # AlertStateManager
         self.debug = debug
 
         self.session = requests.Session()
-
-    # ---------------- STATE FILE ----------------
-
-    def _load_state(self) -> dict:
-        try:
-            with open(self.state_file, "r") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-
-    def _save_state(self, state: dict):
-        try:
-            with open(self.state_file, "w") as f:
-                json.dump(state, f)
-        except Exception as e:
-            if self.debug:
-                print(f"[DailySummary] Failed to save state: {e}")
 
     # ---------------- TIME HELPERS ----------------
 
@@ -75,8 +54,7 @@ class DailySummaryManager:
 
     def _solar_window(self, dt_local):
         """
-        Returns (sunrise, sunset). Uses main script's MORNING_GRACE / EVENING_GRACE
-        indirectly because sunset offset is applied later.
+        Returns (sunrise, sunset). Offset is handled separately.
         """
         from astral.sun import sun
         s = sun(self.astral_loc.observer, date=dt_local.date(), tzinfo=dt_local.tzinfo)
@@ -84,10 +62,14 @@ class DailySummaryManager:
 
     # ---------------- PUBLIC ENTRYPOINT ----------------
 
-    def maybe_generate_summary(self, local_results: List[Dict[str, Any]], force: bool = False) -> Optional[str]:
+    def maybe_generate_summary(
+        self,
+        local_results: List[Dict[str, Any]],
+        force: bool = False
+    ) -> Optional[str]:
         """
-        Returns a summary string if it is time to send the daily summary.
-        Returns None if no summary should be sent.
+        Returns a summary string if it is time to send the daily summary,
+        or None if not.
         """
         if not self.cfg.enabled:
             return None
@@ -95,16 +77,19 @@ class DailySummaryManager:
         dt_local = self._now_local()
         date_str = dt_local.strftime("%Y-%m-%d")
 
-        state = self._load_state()
-        last = state.get("daily_summary", {})
-        already_sent = last.get("date") == date_str and last.get("sent")
+        # Load last-sent record from alert_state
+        daily_state = self.state.get_daily_state()
+        last_date = daily_state.get("date")
+        already_sent = (last_date == date_str) and daily_state.get("sent")
 
         if self.debug:
             print(f"[DailySummary] date={date_str} already_sent={already_sent} force={force}")
 
+        # If we've already sent today and not forcing → no summary
         if not force and already_sent:
             return None
 
+        # If time is not right → skip
         if not self._should_run_now(dt_local, force):
             return None
 
@@ -126,13 +111,12 @@ class DailySummaryManager:
 
         # Compose message text
         total = round(sum(v for v in per_inv.values()), 2)
-        lines = [f"{n}: {v:.2f} kWh" for n, v in sorted(per_inv.items())]
+        lines = [f"{name}: {val:.2f} kWh" for name, val in sorted(per_inv.items())]
         lines.append(f"Total: {total:.2f} kWh")
         summary_text = "\n".join(lines)
 
-        # Mark sent
-        state["daily_summary"] = {"date": date_str, "sent": True}
-        self._save_state(state)
+        # Mark as sent in unified alert_state
+        self.state.set_daily_state({"date": date_str, "sent": True})
 
         return summary_text
 
@@ -153,7 +137,7 @@ class DailySummaryManager:
     # ---------------- API SUMMARY ----------------
 
     def _fetch_api_summary(self) -> Optional[Dict[str, float]]:
-        """Return {"site_total": kWh} or {"Inverter1": val, ...} or None."""
+        """Return {"site_total": kWh} or {"InverterX": val, ...} or None."""
         if not (self.cfg.api_key and self.cfg.site_id):
             return None
 
@@ -191,13 +175,14 @@ class DailySummaryManager:
 
     def _compute_modbus_summary(self, local_results: List[Dict[str, Any]]) -> Dict[str, float]:
         """
-        Compute per-inverter deltas based on lifetime Wh (e_total_Wh).
+        Compute per-inverter deltas using lifetime Wh (e_total_Wh).
+        Uses unified alert_state instead of a module-level JSON file.
         """
         dt_local = self._now_local()
         date_str = dt_local.strftime("%Y-%m-%d")
 
-        state = self._load_state()
-        energy_state = state.setdefault("energy", {})
+        # Load per-day baseline from alert_state
+        baseline = self.state.get_energy_baseline()
 
         totals = {}
 
@@ -210,15 +195,17 @@ class DailySummaryManager:
             if e_total_Wh is None:
                 continue
 
-            baseline = energy_state.get(key)
-            if baseline is None:
-                # first sample of the day
-                energy_state[key] = e_total_Wh
+            first = baseline.get(key)
+            if first is None:
+                # first seen value of the day → initialize baseline
+                baseline[key] = e_total_Wh
                 delta_Wh = 0.0
             else:
-                delta_Wh = max(0.0, e_total_Wh - float(baseline))
+                delta_Wh = max(0.0, e_total_Wh - float(first))
 
             totals[disp] = round(delta_Wh / 1000.0, 2)
 
-        self._save_state(state)
+        # Save updated baseline
+        self.state.set_energy_baseline(baseline)
+
         return totals

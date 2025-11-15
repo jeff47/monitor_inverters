@@ -43,6 +43,7 @@ from anomaly_detector import AnomalyDetector, DetectionSettings
 from solaredge_api_checker import SolarEdgeAPIChecker
 from daily_summary import DailySummaryManager, DailySummaryConfig
 from notifiers import Notifier, Healthchecks
+from alert_state import AlertStateManager, AlertStateConfig
 
 from utils import (
     clean_serial,
@@ -82,67 +83,66 @@ def solar_window(dt_local, astral_loc, morning_grace, evening_grace):
 
 # ---------------- ALERT REPETITION CONTROL ----------------
 
-_ALERT_STATE_CACHE = None
 
-def load_alert_state():
-    global _ALERT_STATE_CACHE
-    if _ALERT_STATE_CACHE is not None:
-        return _ALERT_STATE_CACHE
-    try:
-        with open(ALERT_STATE_FILE, "r") as f:
-            _ALERT_STATE_CACHE = json.load(f)
-    except Exception:
-        _ALERT_STATE_CACHE = {}
-    return _ALERT_STATE_CACHE
+# def load_alert_state():
+#     global _ALERT_STATE_CACHE
+#     if _ALERT_STATE_CACHE is not None:
+#         return _ALERT_STATE_CACHE
+#     try:
+#         with open(ALERT_STATE_FILE, "r") as f:
+#             _ALERT_STATE_CACHE = json.load(f)
+#     except Exception:
+#         _ALERT_STATE_CACHE = {}
+#     return _ALERT_STATE_CACHE
 
-def save_alert_state(state):
-    try:
-        with open(ALERT_STATE_FILE, "w") as f:
-            json.dump(state, f)
-    except Exception as e:
-        print(f"⚠️ Failed to save alert state: {e}", file=sys.stderr)
+# def save_alert_state(state):
+#     try:
+#         with open(ALERT_STATE_FILE, "w") as f:
+#             json.dump(state, f)
+#     except Exception as e:
+#         print(f"⚠️ Failed to save alert state: {e}", file=sys.stderr)
 
-def should_alert(key_text):
-    """Return True if alert for 'key_text' should be triggered now (after X/Y rule)."""
-    serial = clean_serial(key_text)
-    key = serial if serial else key_text.strip().upper()
-    state = load_alert_state()
-    now = time.time()
+# def should_alert(key_text):
+#     """Return True if alert for 'key_text' should be triggered now (after X/Y rule)."""
+#     serial = clean_serial(key_text)
+#     key = serial if serial else key_text.strip().upper()
+#     state = load_alert_state()
+#     now = time.time()
 
-    record = state.get(key) or {}
-    first_ts = record.get("first", now)
-    count = record.get("count", 0)
+#     record = state.get(key) or {}
+#     first_ts = record.get("first", now)
+#     count = record.get("count", 0)
 
-    # reset window if expired or malformed
-    if not isinstance(first_ts, (int, float)) or now - first_ts > ALERT_REPEAT_WINDOW_MIN * 60:
-        first_ts = now
-        count = 0
+#     # reset window if expired or malformed
+#     if not isinstance(first_ts, (int, float)) or now - first_ts > ALERT_REPEAT_WINDOW_MIN * 60:
+#         first_ts = now
+#         count = 0
 
-    count += 1
-    record.update({"first": first_ts, "count": count})
-    state[key] = record
-    save_alert_state(state)
+#     count += 1
+#     record.update({"first": first_ts, "count": count})
+#     state[key] = record
+#     save_alert_state(state)
 
-    return count >= ALERT_REPEAT_COUNT
+#     return count >= ALERT_REPEAT_COUNT
 
 
-# ---------------- RECOVERY TRACKING ----------------
-def update_inverter_states(results, notifier):
-    """Track inverter mode transitions and issue recovery notifications."""
-    state = load_alert_state()
-    recoveries = []
-    for r in results:
-        key_display = inv_display_from_parts(r.get("model"), r.get("serial"))
-        key_state = clean_serial(r.get("serial")) or key_display.upper()
-        st_txt = status_human(r.get("status", 0))
-        last_mode = state.get(key_state, {}).get("last_mode")
-        if last_mode in ("Fault", "Off") and st_txt == "Producing":
-            msg = f"{key_display}: recovered from {last_mode} → Producing"
-            recoveries.append(msg)
-            notifier.send("SolarEdge Recovery", msg, priority=0)
-        state.setdefault(key_state, {})["last_mode"] = st_txt
-    save_alert_state(state)
-    return recoveries
+# # ---------------- RECOVERY TRACKING ----------------
+# def update_inverter_states(results, notifier):
+#     """Track inverter mode transitions and issue recovery notifications."""
+#     state = load_alert_state()
+#     recoveries = []
+#     for r in results:
+#         key_display = inv_display_from_parts(r.get("model"), r.get("serial"))
+#         key_state = clean_serial(r.get("serial")) or key_display.upper()
+#         st_txt = status_human(r.get("status", 0))
+#         last_mode = state.get(key_state, {}).get("last_mode")
+#         if last_mode in ("Fault", "Off") and st_txt == "Producing":
+#             msg = f"{key_display}: recovered from {last_mode} → Producing"
+#             recoveries.append(msg)
+#             notifier.send("SolarEdge Recovery", msg, priority=0)
+#         state.setdefault(key_state, {})["last_mode"] = st_txt
+#     save_alert_state(state)
+#     return recoveries
 
 
 # ---------------- SIMULATION CONSTANTS ----------------
@@ -231,6 +231,16 @@ def main():
     MODBUS_TIMEOUT = cfg.thresholds.modbus_timeout
     MODBUS_RETRIES = cfg.thresholds.modbus_retries
 
+    # ---- Stage 3: new AlertStateManager ----
+    state_cfg = AlertStateConfig(
+        path=cfg.alerts.state_file,
+        repeat_count=cfg.alerts.repeat_count,
+        repeat_window_min=cfg.alerts.repeat_window_min,
+    )
+
+    alert_mgr = AlertStateManager(state_cfg, debug=args.debug)
+
+
     # Detection engine (Stage 3)
     detector = AnomalyDetector(
         DetectionSettings(
@@ -245,10 +255,6 @@ def main():
     )
 
     # Alerts
-    global ALERT_STATE_FILE, ALERT_REPEAT_COUNT, ALERT_REPEAT_WINDOW_MIN
-    ALERT_REPEAT_COUNT = cfg.alerts.repeat_count
-    ALERT_REPEAT_WINDOW_MIN = cfg.alerts.repeat_window_min
-    ALERT_STATE_FILE = cfg.alerts.state_file
     HEALTHCHECKS_URL = cfg.alerts.healthchecks_url
 
     # Pushover
@@ -286,7 +292,7 @@ def main():
         cfg=daily_cfg,
         astral_loc=ASTRAL_LOC,
         status_func=status_human,
-        state_file=ALERT_STATE_FILE,
+        state=alert_mgr,
         debug=args.debug,
     )
 
@@ -407,8 +413,9 @@ def main():
         confirmed = []
         for msg in alerts:
             k = key_for_alert_message(msg)
-            if should_alert(k):
+            if alert_mgr.should_alert(k):
                 confirmed.append(msg)
+                alert_mgr.record_alert(k)
 
         if confirmed:
             msg = "\n".join(confirmed)
@@ -439,7 +446,7 @@ def main():
     alerts.extend(cloud_alerts)
 
     # Track and notify recoveries ---
-    recoveries = update_inverter_states(read_ok, notifier)
+    recoveries = alert_mgr.update_inverter_states(read_ok, notifier)
     for msg in recoveries:
         log(f"ℹ️ {msg}")
 
@@ -463,8 +470,10 @@ def main():
         confirmed = []
         for msg in alerts:
             k = key_for_alert_message(msg)
-            if should_alert(k):
+            if alert_mgr.should_alert(k):
                 confirmed.append(msg)
+                alert_mgr.record_alert(k)
+
         if confirmed:
             msg = "\n".join(confirmed)
             log(f"ALERT:\n{msg}")
