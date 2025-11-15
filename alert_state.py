@@ -138,33 +138,10 @@ class AlertStateManager:
     # Alert repeat-check logic
     # -------------------------------------------------------------------
 
-    def should_alert(self, key_text: str) -> bool:
+    def record_detection(self, key_text: str) -> int:
         """
-        Returns True if we should emit an alert for key_text.
-        Applies repeat_count and repeat_window_min logic.
-        """
-        now = time.time()
-        state = self._load()
-
-        alerts = state.setdefault("alerts", {})
-        timestamps: List[float] = alerts.get(key_text, [])
-
-        # Filter timestamps within window
-        window_sec = self._repeat_window_min * 60
-        cutoff = now - window_sec
-        recent = [ts for ts in timestamps if ts >= cutoff]
-
-        if self.debug:
-            print(f"[AlertState] For key '{key_text}': "
-                  f"recent={len(recent)}, required={self._repeat_count}")
-
-        # Should alert if we haven't met repeat_count occurrences yet
-        return len(recent) < self._repeat_count
-
-    def record_alert(self, key_text: str) -> None:
-        """
-        Record that an alert has been emitted. The result of should_alert()
-        should almost always be paired with record_alert().
+        Record a detection event (NOT an emitted alert).
+        Returns the number of detections within the repeat window.
         """
         now = time.time()
         state = self._load()
@@ -174,12 +151,36 @@ class AlertStateManager:
 
         timestamps.append(now)
 
-        # Trim old entries
+        # Trim old ones
         window_sec = self._repeat_window_min * 60
         cutoff = now - window_sec
-        alerts[key_text] = [ts for ts in timestamps if ts >= cutoff]
+        recent = [ts for ts in timestamps if ts >= cutoff]
+        alerts[key_text] = recent
 
         self._save()
+        return len(recent)
+
+
+    def should_alert(self, key_text: str) -> bool:
+        """
+        Return True only if the number of recent detections
+        meets/exceeds repeat_count.
+        """
+        now = time.time()
+        state = self._load()
+
+        alerts = state.setdefault("alerts", {})
+        timestamps = alerts.get(key_text, [])
+
+        window_sec = self._repeat_window_min * 60
+        cutoff = now - window_sec
+        recent = [ts for ts in timestamps if ts >= cutoff]
+
+        if self.debug:
+            print(f"[AlertState] For key '{key_text}': "
+                f"recent={len(recent)}, required={self._repeat_count}")
+
+        return len(recent) >= self._repeat_count
 
     # -------------------------------------------------------------------
     # Inverter alert-state updater (replaces update_inverter_states)

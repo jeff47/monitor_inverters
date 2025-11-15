@@ -38,7 +38,8 @@ from utils import (
     clean_serial,
     inv_display_from_parts,
     extract_serial_from_text,
-    status_human
+    status_human,
+    DaylightPolicy,
 )
 
 
@@ -56,21 +57,6 @@ def key_for_alert_message(msg: str) -> str:
     if ser:
         return ser
     return (msg.split(":", 1)[0].strip().upper()) if ":" in msg else msg.strip().upper()
-
-
-# ---------------- UTILITIES ----------------
-def now_local(tzname: str):
-    """Pure: return current datetime in the given timezone."""
-    return datetime.now(pytz.timezone(tzname))
-
-
-def solar_window(dt_local, astral_loc, morning_grace, evening_grace):
-    """Pure: compute day/sunrise/sunset using explicit parameters."""
-    s = sun(astral_loc.observer, date=dt_local.date(), tzinfo=dt_local.tzinfo)
-    sunrise = s["sunrise"] + morning_grace
-    sunset = s["sunset"] - evening_grace
-    return (sunrise <= dt_local <= sunset, sunrise, sunset)
-
 
 # ---------------- CLI ARGUMENTS ----------------
 def build_arg_parser():
@@ -214,7 +200,7 @@ def main():
         )
     )
 
-    # Verbose modbus info
+    # Verbose modbus module info
     if args.verbose and not args.quiet:
         print(f"solaredge_modbus version: {getattr(solaredge_modbus, '__version__', '(unknown)')}")
         print(f"Loaded from: {getattr(solaredge_modbus, '__file__', '(unknown path)')}")
@@ -239,21 +225,29 @@ def main():
         health.send_test_fail(log)
         return 0
 
-
-    dt_local = now_local(cfg.site.tzname)
-    is_day, sunrise, sunset = solar_window(
-        dt_local,
-        ASTRAL_LOC,
-        cfg.thresholds.morning_grace,
-        cfg.thresholds.evening_grace,
+    # Daylight policy (Astral daylight logic + simulation overrides)
+    daylight = DaylightPolicy(
+        astral_loc=ASTRAL_LOC,
+        thresholds=cfg.thresholds,
+        tzname=cfg.site.tzname,
+        log=log,
+        simulation_engine=sim,
     )
+
+    dt_local = daylight.now_local()
+    is_day, sunrise, sunset = daylight.compute_daylight_window(dt_local)
+    is_day = daylight.override_simulation(is_day)
+
 
     # Simulation daylight override
     is_day = sim.override_daylight(is_day)
 
     if args.verbose and not args.quiet:
-        log(f"[time] now={dt_local.strftime('%Y-%m-%d %H:%M:%S %Z')} day={is_day} "
-            f"sunrise+grace={sunrise.strftime('%H:%M')} sunset-grace={sunset.strftime('%H:%M')}")
+        log(
+            f"[time] now={dt_local.strftime('%Y-%m-%d %H:%M:%S %Z')} "
+            f"day={is_day} sunrise+grace={sunrise.strftime('%H:%M')} "
+            f"sunset-grace={sunset.strftime('%H:%M')}"
+        )
 
     results, any_success = reader.read_all(
         cfg.inverters,
@@ -293,13 +287,19 @@ def main():
     all_sleeping = all(r.get("status") == 2 for r in results if not r.get("error"))
 
     # Skip Modbus checks at night
-    if all_sleeping or not is_day:
-        if args.verbose and not args.quiet:
-            reason = "all Sleeping" if all_sleeping else "Astral night"
-            log(f"Night window ({reason}): skipping Modbus anomaly checks.")
+    skip_modbus = daylight.should_skip_modbus(
+        results,
+        is_day,
+        args.verbose,
+        args.quiet,
+    )
+
 
     read_ok = [r for r in results if not r.get("error")]
-    alerts = detector.detect(read_ok, is_day=is_day)
+    alerts = []
+    if not skip_modbus:
+        alerts = detector.detect(read_ok, is_day=is_day)
+
 
     cloud_alerts = api_checker.check(read_ok)
     alerts.extend(cloud_alerts)
@@ -321,13 +321,19 @@ def main():
     alerts = list(unique_alerts.values())
 
     exit_code = 0
+
     if alerts:
         confirmed = []
+
         for msg in alerts:
             k = key_for_alert_message(msg)
+
+            # 1. ALWAYS record this detection first (not an alert yet)
+            count = alert_mgr.record_detection(k)
+
+            # 2. Now decide if an alert should be emitted
             if alert_mgr.should_alert(k):
                 confirmed.append(msg)
-                alert_mgr.record_alert(k)
 
         if confirmed:
             msg = "\n".join(confirmed)
@@ -336,10 +342,13 @@ def main():
             health.fail(confirmed[0])
             exit_code = 2
         else:
+            # Detections were recorded but threshold not reached
             exit_code = 0
+
     else:
         log("OK: all inverters normal.")
         health.ok("All normal")
+
 
     try:
         if args.force_summary:
@@ -347,7 +356,7 @@ def main():
         summary = daily_mgr.maybe_generate_summary(read_ok, force=args.force_summary)
         if summary:
             log(summary)
-            date_str = now_local(cfg.site.tzname).strftime("%Y-%m-%d")
+            date_str = daylight.now_local().strftime("%Y-%m-%d")
             notifier.send(f"SolarEdge Daily Summary — {date_str}", summary, priority=0)
     except Exception as e:
         log(f"⚠️ Failed to compute/send daily summary: {e}", err=True)

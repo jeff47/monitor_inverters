@@ -1,5 +1,87 @@
 # utils.py
 import re
+from datetime import datetime
+from astral.sun import sun
+import pytz
+
+
+class DaylightPolicy:
+    """
+    Encapsulates all daylight and night-window logic:
+      - Astral sunrise/sunset calculation
+      - Morning/evening grace periods
+      - Sleeping-inverter detection
+      - Simulation daylight override
+      - Skip-Modbus decision logic
+    """
+
+    def __init__(self, astral_loc, thresholds, tzname, log, simulation_engine):
+        """
+        Parameters:
+            astral_loc         - Astral LocationInfo
+            thresholds         - cfg.thresholds (morning_grace, evening_grace, etc.)
+            tzname             - site timezone string (e.g., "America/New_York")
+            log                - logger function injected from main()
+            simulation_engine  - SimulationEngine instance (for daylight override)
+        """
+        self.astral_loc = astral_loc
+        self.thresholds = thresholds
+        self.tz = pytz.timezone(tzname)
+        self.log = log
+        self.sim = simulation_engine
+
+    # ---------------------------
+    # Time and daylight calculation
+    # ---------------------------
+
+    def now_local(self):
+        """Return current datetime with site's timezone applied."""
+        return datetime.now(self.tz)
+
+    def compute_daylight_window(self, dt_local):
+        """
+        Compute raw Astral sunrise/sunset, apply morning/evening grace periods,
+        and determine whether dt_local is within the adjusted daylight window.
+        Returns: (is_day, sunrise_adj, sunset_adj)
+        """
+        s = sun(self.astral_loc.observer, date=dt_local.date(), tzinfo=self.tz)
+
+        sunrise = s["sunrise"] + self.thresholds.morning_grace
+        sunset = s["sunset"] - self.thresholds.evening_grace
+
+        is_day = sunrise <= dt_local <= sunset
+        return is_day, sunrise, sunset
+
+    def override_simulation(self, is_day):
+        """
+        Simulation engine may force daylight behavior for test scenarios.
+        """
+        return self.sim.override_daylight(is_day)
+
+    # ---------------------------
+    # Decision logic for Modbus checks
+    # ---------------------------
+
+    def should_skip_modbus(self, results, is_day, verbose, quiet):
+        """
+        Determine whether modbus anomaly checks should be skipped.
+
+        Skip if:
+            - Astral reports night (is_day == False)
+            - All responding inverters report Sleeping (status == 2)
+        """
+        all_sleeping = all(
+            r.get("status") == 2 for r in results if not r.get("error")
+        )
+
+        if all_sleeping or not is_day:
+            if verbose and not quiet:
+                reason = "all Sleeping" if all_sleeping else "Astral night"
+                self.log(f"Night window ({reason}): skipping Modbus anomaly checks.")
+            return True
+
+        return False
+
 
 SERIAL_RE = re.compile(r"([0-9A-Fa-f]{6,})")
 
