@@ -33,3 +33,25 @@ def extract_serial_from_text(s: str) -> str:
         return m.group(1).upper()
     m2 = SERIAL_RE.search(s)
     return m2.group(1).upper() if m2 else ""
+
+# -----------------------------
+# Status decoding helpers
+# -----------------------------
+
+SUNSPEC_STATUS_MAP = {
+    1: "Off",
+    2: "Sleeping",
+    3: "Waking Up",
+    4: "Producing",
+    5: "Producing",
+    6: "Power Reduction",
+    7: "Shutdown",
+    8: "Fault",
+    9: "Maintenance",
+}
+
+def status_human(code):
+    """Convert numeric SunSpec status to human-readable text."""
+    if code is None:
+        return "Unknown"
+    return SUNSPEC_STATUS_MAP.get(code, f"Unknown({code})")

@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import solaredge_modbus
 from config import InverterConfig
+from utils import status_human
 
 # ---------------- IDENTITY HELPERS ----------------
 def clean_serial(s: str) -> str:
@@ -133,47 +134,40 @@ class InverterReader:
             "raw": values,
         }
 
-    def read_all(self, inverters: list[InverterConfig], simulate: bool = False) -> list[dict]:
-        """
-        Read all inverters in parallel and return a list of normalized dicts.
-        If simulate=True, produces fake values.
-        """
-
-        # --- Simulation mode ---
-        if simulate:
-            return [self._simulated(inv) for inv in inverters]
-
+    def read_all(self, inverters: list[InverterConfig], verbose=False, quiet=False):
         results = []
+        any_success = False
 
-        # --- Parallel Modbus reads ---
-        with ThreadPoolExecutor(max_workers=len(inverters)) as ex:
-            fut_map = {ex.submit(self.read_one, inv): inv for inv in inverters}
+        with ThreadPoolExecutor(max_workers=min(8, len(inverters) or 1)) as ex:
+            futures = {ex.submit(self.read_one, inv): inv for inv in inverters}
 
-            for fut in as_completed(fut_map):
-                inv = fut_map[fut]
+            for future in as_completed(futures):
+                inv = futures[future]
                 try:
-                    snap = fut.result()
-                    results.append(snap)
+                    r = future.result()
                 except Exception as e:
-                    # If read_one() failed, provide structured failure
-                    results.append({
-                        "name": inv.name,
-                        "id": None,
-                        "model": None,
-                        "serial": None,
-                        "status": None,
-                        "vendor_status": None,
-                        "pac_W": None,
-                        "vdc_V": None,
-                        "idc_A": None,
-                        "temp_C": None,
-                        "freq_Hz": None,
-                        "e_total_Wh": None,
-                        "raw": None,
-                        "error": str(e),
-                    })
+                    r = {"id": inv.name, "name": inv.name, "error": True}
+                    print(f"[{inv.name}] Threaded read exception: {e}", file=sys.stderr)
+                else:
+                    if not r.get("error"):
+                        any_success = True
 
-        return results
+                results.append(r)
+
+                if verbose and not quiet and not r.get("error"):
+                    pac = r.get("pac_W")
+                    vdc = r.get("vdc_V")
+                    idc = r.get("idc_A")
+                    status = r.get("status")
+
+                    pac_s = f"{pac:.0f}W" if isinstance(pac, (int,float)) else "N/A"
+                    vdc_s = f"{vdc:.1f}V" if isinstance(vdc,(int,float)) else "N/A"
+                    idc_s = f"{idc:.2f}A" if isinstance(idc,(int,float)) else "N/A"
+                    status_s = status_human(status)
+
+                    print(f"[{r['id']}] (modbus) PAC={pac_s} Vdc={vdc_s} Idc={idc_s} status={status_s}")
+
+        return results, any_success
 
     def _simulated(self, inv_cfg: InverterConfig) -> dict:
         serial = f"SIM-{inv_cfg.name}"

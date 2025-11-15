@@ -357,32 +357,7 @@ def main():
         log(f"[time] now={dt_local.strftime('%Y-%m-%d %H:%M:%S %Z')} day={is_day} "
             f"sunrise+grace={sunrise.strftime('%H:%M')} sunset-grace={sunset.strftime('%H:%M')}")
 
-    results, any_success = [], False
-
-    # Threaded Modbus reads
-    with ThreadPoolExecutor(max_workers=min(8, len(INVERTERS) or 1)) as executor:
-        futures = {executor.submit(reader.read_one, inv): inv for inv in INVERTERS}
-        for future in as_completed(futures):
-            inv = futures[future]  # inv is an InverterConfig now
-            try:
-                r = future.result()
-            except Exception as e:
-                # Make sure we include name so simulate_target and logging still work
-                r = {"id": inv.name, "name": inv.name, "error": True}
-                print(f"[{inv.name}] Threaded read exception: {e}", file=sys.stderr)
-            results.append(r)
-            if not r.get("error"):
-                any_success = True
-                if args.verbose and not args.quiet:
-                    pac = r.get("pac_W")
-                    vdc = r.get("vdc_V")
-                    idc = r.get("idc_A")
-                    status = r.get("status")
-                    pac_s = f"{pac:.0f}W" if isinstance(pac, (int, float)) else "N/A"
-                    vdc_s = f"{vdc:.1f}V" if isinstance(vdc, (int, float)) else "N/A"
-                    idc_s = f"{idc:.2f}A" if isinstance(idc, (int, float)) else "N/A"
-                    log(f"[{r['id']}] (modbus) PAC={pac_s} Vdc={vdc_s} Idc={idc_s} status={status}")
-
+    results, any_success = reader.read_all(INVERTERS, verbose=args.verbose, quiet=args.quiet)
 
     # --- Simulation injection ---
     simulation_info = None
