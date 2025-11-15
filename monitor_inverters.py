@@ -42,7 +42,7 @@ from inverter_reader import InverterReader, ReaderSettings
 from anomaly_detector import AnomalyDetector, DetectionSettings
 from solaredge_api_checker import SolarEdgeAPIChecker
 from daily_summary import DailySummaryManager, DailySummaryConfig
-
+from notifiers import Notifier, Healthchecks
 
 from utils import (
     clean_serial,
@@ -93,57 +93,58 @@ def load_optimizer_expectations():
 
     return total_expected, per_inv_expected
 
-def pushover_notify(title: str, message: str, priority: int = 0):
-    """Send a Pushover notification if credentials are configured."""
-    user_key = (PUSHOVER_USER_KEY or "").strip()
-    api_token = (PUSHOVER_API_TOKEN or "").strip()
-    if not user_key and not api_token:
-        if os.environ.get("DEBUG"):
-            print("ℹ️  Pushover disabled (no credentials configured).", file=sys.stderr)
-        return
-    if bool(user_key) != bool(api_token):
-        raise RuntimeError("Configuration error: Both PUSHOVER_USER_KEY and PUSHOVER_API_TOKEN must be set for Pushover.")
-    data = urlencode({
-        "token": api_token,
-        "user": user_key,
-        "title": title,
-        "message": message,
-        "priority": str(priority),
-    }).encode("utf-8")
-    try:
-        req = urllib.request.Request("https://api.pushover.net/1/messages.json", data=data)
-        urllib.request.urlopen(req, timeout=10)
-    except Exception as e:
-        print(f"⚠️ Failed to send Pushover alert: {e}", file=sys.stderr)
+# def pushover_notify(title: str, message: str, priority: int = 0):
+#     """Send a Pushover notification if credentials are configured."""
+#     user_key = (PUSHOVER_USER_KEY or "").strip()
+#     api_token = (PUSHOVER_API_TOKEN or "").strip()
+#     if not user_key and not api_token:
+#         if os.environ.get("DEBUG"):
+#             print("ℹ️  Pushover disabled (no credentials configured).", file=sys.stderr)
+#         return
+#     if bool(user_key) != bool(api_token):
+#         raise RuntimeError("Configuration error: Both PUSHOVER_USER_KEY and PUSHOVER_API_TOKEN must be set for Pushover.")
+#     data = urlencode({
+#         "token": api_token,
+#         "user": user_key,
+#         "title": title,
+#         "message": message,
+#         "priority": str(priority),
+#     }).encode("utf-8")
+#     try:
+#         req = urllib.request.Request("https://api.pushover.net/1/messages.json", data=data)
+#         urllib.request.urlopen(req, timeout=10)
+#     except Exception as e:
+#         print(f"⚠️ Failed to send Pushover alert: {e}", file=sys.stderr)
 
-def ping_healthcheck(status: str, message: str = ""):
-    """Ping Healthchecks.io with optional status message."""
-    if not HEALTHCHECKS_URL:
-        if os.environ.get("DEBUG"):
-            print("ℹ️  Healthchecks disabled (no URL configured).", file=sys.stderr)
-        return
-    url = HEALTHCHECKS_URL.rstrip("/")
-    if status == "fail":
-        url += "/fail"
-    parsed = list(urlparse(url))
-    query = {}
-    if message:
-        query["msg"] = message[:200]
-    parsed[4] = urlencode(query)
-    full_url = urlunparse(parsed)
-    try:
-        urllib.request.urlopen(full_url, timeout=5)
-    except urllib.error.URLError as e:
-        print(f"⚠️ Failed to ping Healthchecks.io: {e}", file=sys.stderr)
+# def ping_healthcheck(status: str, message: str = ""):
+#     """Ping Healthchecks.io with optional status message."""
+#     if not HEALTHCHECKS_URL:
+#         if os.environ.get("DEBUG"):
+#             print("ℹ️  Healthchecks disabled (no URL configured).", file=sys.stderr)
+#         return
+#     url = HEALTHCHECKS_URL.rstrip("/")
+#     if status == "fail":
+#         url += "/fail"
+#     parsed = list(urlparse(url))
+#     query = {}
+#     if message:
+#         query["msg"] = message[:200]
+#     parsed[4] = urlencode(query)
+#     full_url = urlunparse(parsed)
+#     try:
+#         urllib.request.urlopen(full_url, timeout=5)
+#     except urllib.error.URLError as e:
+#         print(f"⚠️ Failed to ping Healthchecks.io: {e}", file=sys.stderr)
 
-def now_local():
-    return datetime.now(pytz.timezone(TZNAME))
+def now_local(tzname: str):
+    """Pure: return current datetime in the given timezone."""
+    return datetime.now(pytz.timezone(tzname))
 
-def solar_window(dt_local):
-    """Return (is_daylight, sunrise, sunset) with grace windows."""
-    s = sun(ASTRAL_LOC.observer, date=dt_local.date(), tzinfo=dt_local.tzinfo)
-    sunrise = s["sunrise"] + MORNING_GRACE
-    sunset = s["sunset"] - EVENING_GRACE
+def solar_window(dt_local, astral_loc, morning_grace, evening_grace):
+    """Pure: compute day/sunrise/sunset using explicit parameters."""
+    s = sun(astral_loc.observer, date=dt_local.date(), tzinfo=dt_local.tzinfo)
+    sunrise = s["sunrise"] + morning_grace
+    sunset = s["sunset"] - evening_grace
     return (sunrise <= dt_local <= sunset, sunrise, sunset)
 
 def status_text(code: int) -> str:
@@ -207,7 +208,7 @@ def should_alert(key_text):
 
 
 # ---------------- RECOVERY TRACKING ----------------
-def update_inverter_states(results):
+def update_inverter_states(results, notifier):
     """Track inverter mode transitions and issue recovery notifications."""
     state = load_alert_state()
     recoveries = []
@@ -219,7 +220,7 @@ def update_inverter_states(results):
         if last_mode in ("Fault", "Off") and st_txt == "Producing":
             msg = f"{key_display}: recovered from {last_mode} → Producing"
             recoveries.append(msg)
-            pushover_notify("SolarEdge Recovery", msg, priority=0)
+            notifier.send("SolarEdge Recovery", msg, priority=0)
         state.setdefault(key_state, {})["last_mode"] = st_txt
     save_alert_state(state)
     return recoveries
@@ -373,18 +374,6 @@ Exit Codes:
 # ---------------- MAIN ----------------
 def main():
     global cfg
-    global CITY_NAME, LAT, LON, TZNAME
-    global ASTRAL_LOC
-    global INVERTERS
-    global MORNING_GRACE, EVENING_GRACE
-    global ABS_MIN_WATTS, SAFE_DC_VOLT_MAX, ZERO_CURRENT_EPS
-    global PEER_COMPARE, PEER_MIN_WATTS, PEER_LOW_RATIO
-    global MODBUS_TIMEOUT, MODBUS_RETRIES
-    global ALERT_REPEAT_COUNT, ALERT_REPEAT_WINDOW_MIN, ALERT_STATE_FILE
-    global HEALTHCHECKS_URL
-    global PUSHOVER_USER_KEY, PUSHOVER_API_TOKEN
-    global ENABLE_SOLAREDGE_API, SOLAREDGE_API_KEY, SOLAREDGE_SITE_ID
-    global DAILY_SUMMARY_ENABLED, DAILY_SUMMARY_METHOD, DAILY_SUMMARY_OFFSET_MIN
 
     ap = build_arg_parser()
     args = ap.parse_args()
@@ -397,18 +386,18 @@ def main():
     LAT = cfg.site.lat
     LON = cfg.site.lon
     TZNAME = cfg.site.tzname
-
     ASTRAL_LOC = LocationInfo(CITY_NAME, "USA", TZNAME, LAT, LON)
 
     # Inverters
-    INVERTERS = []
-    for inv_cfg in cfg.inverters:
-        INVERTERS.append({
+    INVERTERS = [
+        {
             "name": inv_cfg.name,
             "host": inv_cfg.host,
             "port": inv_cfg.port,
             "unit": inv_cfg.unit,
-        })
+        }
+        for inv_cfg in cfg.inverters
+    ]
 
     # Thresholds
     MORNING_GRACE = cfg.thresholds.morning_grace
@@ -436,6 +425,7 @@ def main():
     )
 
     # Alerts
+    global ALERT_STATE_FILE, ALERT_REPEAT_COUNT, ALERT_REPEAT_WINDOW_MIN
     ALERT_REPEAT_COUNT = cfg.alerts.repeat_count
     ALERT_REPEAT_WINDOW_MIN = cfg.alerts.repeat_window_min
     ALERT_STATE_FILE = cfg.alerts.state_file
@@ -445,10 +435,18 @@ def main():
     PUSHOVER_USER_KEY = cfg.pushover.user_key
     PUSHOVER_API_TOKEN = cfg.pushover.api_token
 
+    # Stage 4.5: unified notifier + healthcheck interface
+    notifier = Notifier(
+        user_key=PUSHOVER_USER_KEY,
+        api_token=PUSHOVER_API_TOKEN,
+    )
+
+    health = Healthchecks(HEALTHCHECKS_URL)
+
     # Cloud API
-    ENABLE_SOLAREDGE_API = cfg.api.enabled
-    SOLAREDGE_API_KEY = cfg.api.api_key
-    SOLAREDGE_SITE_ID = cfg.api.site_id
+    # ENABLE_SOLAREDGE_API = cfg.api.enabled
+    # SOLAREDGE_API_KEY = cfg.api.api_key
+    # SOLAREDGE_SITE_ID = cfg.api.site_id
 
     # Daily Summary
     DAILY_SUMMARY_ENABLED = cfg.alerts.daily_enabled
@@ -477,8 +475,8 @@ def main():
     total_expected, expected_by_serial = load_optimizer_expectations()
 
     api_checker = SolarEdgeAPIChecker(
-        api_key=SOLAREDGE_API_KEY,
-        site_id=SOLAREDGE_SITE_ID,
+        api_key=cfg.api.api_key,
+        site_id=cfg.api.site_id,
         optimizer_expected_total=total_expected,
         optimizer_expected_per_inv=expected_by_serial,
         debug=args.debug,
@@ -508,12 +506,17 @@ def main():
     if args.test_pushover:
         log("🔔 Sending test notification via Pushover...")
         msg = f"Test message from SolarEdge inverter monitor\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        pushover_notify("SolarEdge Monitor Test", msg, priority=0)
+        notifier.send("SolarEdge Monitor Test", msg, priority=0)
         log("✅ Test notification sent (check your device).")
         return 0
 
-    dt_local = now_local()
-    is_day, sunrise, sunset = solar_window(dt_local)
+    dt_local = now_local(TZNAME)
+    is_day, sunrise, sunset = solar_window(
+        dt_local,
+        ASTRAL_LOC,
+        MORNING_GRACE,
+        EVENING_GRACE,
+    )
 
     if args.verbose and not args.quiet:
         log(f"[time] now={dt_local.strftime('%Y-%m-%d %H:%M:%S %Z')} day={is_day} "
@@ -611,13 +614,13 @@ def main():
         if confirmed:
             msg = "\n".join(confirmed)
             log(f"ALERT:\n{msg}")
-            pushover_notify("SolarEdge Monitor Alert", msg, priority=1)
-            ping_healthcheck("fail", message=confirmed[0])
+            notifier.send("SolarEdge Monitor Alert", msg, priority=1)
+            health.fail(confirmed[0])
             return 2
 
         # Suppressed; still count as error but not an alert
         log("Modbus communication failed (suppressed during repeat window)")
-        ping_healthcheck("fail", message="Modbus comm failure")
+        health.fail("Modbus comm failure")
         return 1
 
     all_sleeping = all(r.get("status") == 2 for r in results if not r.get("error"))
@@ -637,7 +640,7 @@ def main():
     alerts.extend(cloud_alerts)
 
     # Track and notify recoveries ---
-    recoveries = update_inverter_states(read_ok)
+    recoveries = update_inverter_states(read_ok, notifier)
     for msg in recoveries:
         log(f"ℹ️ {msg}")
 
@@ -666,14 +669,14 @@ def main():
         if confirmed:
             msg = "\n".join(confirmed)
             log(f"ALERT:\n{msg}")
-            pushover_notify("SolarEdge Monitor Alert", msg, priority=1)
-            ping_healthcheck("fail", message=confirmed[0])
+            notifier.send("SolarEdge Monitor Alert", msg, priority=1)
+            health.fail(confirmed[0])
             exit_code = 2
         else:
             exit_code = 0
     else:
         log("OK: all inverters normal.")
-        ping_healthcheck("ok", message="All normal")
+        health.ok("All normal")
 
     # Always try sending summary, even if alert occurred
     try:
@@ -682,8 +685,8 @@ def main():
         summary = daily_mgr.maybe_generate_summary(read_ok, force=args.force_summary)
         if summary:
             log(summary)
-            date_str = now_local().strftime("%Y-%m-%d")
-            pushover_notify(f"SolarEdge Daily Summary — {date_str}", summary, priority=0)
+            date_str = now_local(TZNAME).strftime("%Y-%m-%d")
+            notifier.send(f"SolarEdge Daily Summary — {date_str}", summary, priority=0)
     except Exception as e:
         log(f"⚠️ Failed to compute/send daily summary: {e}", err=True)
 
