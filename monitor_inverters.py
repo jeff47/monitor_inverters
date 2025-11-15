@@ -48,6 +48,7 @@ from utils import (
     clean_serial,
     inv_display_from_parts,
     extract_serial_from_text,
+    status_human
 )
 
 
@@ -78,20 +79,6 @@ def solar_window(dt_local, astral_loc, morning_grace, evening_grace):
     sunrise = s["sunrise"] + morning_grace
     sunset = s["sunset"] - evening_grace
     return (sunrise <= dt_local <= sunset, sunrise, sunset)
-
-def status_text(code: int) -> str:
-    """Return descriptive status name."""
-    explicit = {
-        1: "Off",
-        2: "Sleeping",
-        3: "Starting",
-        4: "Producing",
-        5: "Throttled",
-        6: "Shutting down",
-        7: "Fault",
-        8: "Standby",
-    }
-    return explicit.get(code, f"Unknown({code})")
 
 # ---------------- ALERT REPETITION CONTROL ----------------
 
@@ -147,7 +134,7 @@ def update_inverter_states(results, notifier):
     for r in results:
         key_display = inv_display_from_parts(r.get("model"), r.get("serial"))
         key_state = clean_serial(r.get("serial")) or key_display.upper()
-        st_txt = status_text(r.get("status", 0))
+        st_txt = status_human(r.get("status", 0))
         last_mode = state.get(key_state, {}).get("last_mode")
         if last_mode in ("Fault", "Off") and st_txt == "Producing":
             msg = f"{key_display}: recovered from {last_mode} → Producing"
@@ -254,7 +241,7 @@ def main():
             peer_min_watts=PEER_MIN_WATTS,
             peer_low_ratio=PEER_LOW_RATIO,
         ),
-        status_formatter=status_text,
+        status_formatter=status_human,
     )
 
     # Alerts
@@ -298,7 +285,7 @@ def main():
     daily_mgr = DailySummaryManager(
         cfg=daily_cfg,
         astral_loc=ASTRAL_LOC,
-        status_func=status_text,
+        status_func=status_human,
         state_file=ALERT_STATE_FILE,
         debug=args.debug,
     )
