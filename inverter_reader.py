@@ -6,12 +6,12 @@ from datetime import datetime
 from typing import Any, Dict
 import time
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import solaredge_modbus
 from config import InverterConfig
 
 # ---------------- IDENTITY HELPERS ----------------
-
 def clean_serial(s: str) -> str:
     if not s:
         return ""
@@ -31,14 +31,11 @@ def inv_display_from_parts(model: str, serial: str) -> str:
         return f"[{ser}]"
     return mb or "UNKNOWN"
 
-
 # ---------------- READER CLASS ----------------
-
 @dataclass
 class ReaderSettings:
     timeout: float
     retries: int
-
 
 class InverterReader:
     """
@@ -178,21 +175,21 @@ class InverterReader:
 
         return results
 
-
-
-    def _simulated(self, inv_cfg):
+    def _simulated(self, inv_cfg: InverterConfig) -> dict:
+        serial = f"SIM-{inv_cfg.name}"
         return {
-            "name": inv_cfg["name"],
-            "id": inv_cfg["id"],
+            "name": inv_cfg.name,
+            "id": serial,
             "model": "SIMULATED",
-            "serial": "SIM12345",
-            "status": "Normal",
-            "vendor_status": "OK",
-            "pac_W": 1234,
-            "vdc_V": 380,
+            "serial": serial,
+            "status": 4,          # Producing
+            "vendor_status": 0,
+            "pac_W": 1234.0,
+            "vdc_V": 380.0,
             "idc_A": 4.1,
             "temp_C": 45.2,
             "freq_Hz": 60.01,
-            "e_total_Wh": 999999,
+            "e_total_Wh": 999_999,
             "raw": {},
         }
+
