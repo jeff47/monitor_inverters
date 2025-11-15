@@ -7,7 +7,7 @@ import urllib.request
 import urllib.parse
 import urllib.error
 import sys
-
+from datetime import datetime
 
 class Notifier:
     """
@@ -51,7 +51,17 @@ class Notifier:
         except Exception as e:
             print(f"⚠️ Failed to send Pushover alert: {e}", file=sys.stderr)
 
-
+    def send_test(self, log):
+            """
+            Send a simple test message to verify Pushover configuration.
+            """
+            log("🔔 Sending test notification via Pushover...")
+            msg = (
+                "Test message from SolarEdge inverter monitor\n"
+                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+            self.send("SolarEdge Monitor Test", msg, priority=0)
+            log("✅ Test notification sent (check your device).")
 
 class Healthchecks:
     """
@@ -81,3 +91,33 @@ class Healthchecks:
 
     def fail(self, message: str = ""):
         self._hit("/fail", message)
+
+    def send_test_ok(self, log):
+        """
+        Send a test OK ping to Healthchecks.io.
+        """
+        if not self.url:
+            log("⚠️ No Healthchecks.io URL configured; skipping Healthchecks OK test.")
+            return
+
+        log("🔧 Sending Healthchecks.io TEST-OK ping...")
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        message = f"TEST OK ping from SolarEdge Monitor at {ts}"
+
+        self._hit("", message)
+        log("✅ TEST-OK Healthchecks ping sent.")
+
+    def send_test_fail(self, log):
+        """
+        Send a test FAIL ping to Healthchecks.io.
+        """
+        if not self.url:
+            log("⚠️ No Healthchecks.io URL configured; skipping Healthchecks FAIL test.")
+            return
+
+        log("🔧 Sending Healthchecks.io TEST-FAIL ping...")
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        message = f"TEST FAIL ping from SolarEdge Monitor at {ts}"
+
+        self._hit("/fail", message)
+        log("❌ TEST-FAIL Healthchecks ping sent.")
