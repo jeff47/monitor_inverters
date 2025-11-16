@@ -134,6 +134,13 @@ def extract_serial_from_text(s: str) -> str:
     m2 = SERIAL_RE.search(s)
     return m2.group(1).upper() if m2 else ""
 
+def key_for_alert_message(msg: str) -> str:
+    """Stable key for dedupe / repeat-suppression."""
+    ser = extract_serial_from_text(msg)
+    if ser:
+        return ser
+    return (msg.split(":", 1)[0].strip().upper()) if ":" in msg else msg.strip().upper()
+
 # -----------------------------
 # Status decoding helpers
 # -----------------------------
