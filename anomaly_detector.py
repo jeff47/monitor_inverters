@@ -62,7 +62,7 @@ class AnomalyDetector:
             else:
                 st_txt = st
 
-            if st not in (2, 4):  # Sleeping or Producing
+            if st not in (2, 3, 4):  # Sleeping or Producing
                 out.append(f"{r['id']}: Abnormal status ({st_txt})")
 
         return out
