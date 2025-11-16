@@ -28,13 +28,16 @@ class AnomalyDetector:
         self.status_text = status_formatter  # optional function: int → string
 
     # ---------------- ENTRYPOINT ----------------
-    def detect(self, results: List[Dict[str, Any]], is_day: bool) -> List[str]:
+    def detect(self, results: List[Dict[str, Any]], is_day: bool, near_edges: bool = False) -> List[str]:
         alerts = []
 
         if is_day:
             alerts.extend(self._detect_abnormal_status(results))
             alerts.extend(self._detect_safedc(results))
-            alerts.extend(self._detect_low_production(results))
+
+            # NEW: suppress low-production alerts if low light
+            if not (near_edges and self._all_below_abs_min(results)):
+                alerts.extend(self._detect_low_production(results))
 
             if self.s.peer_compare and len(results) >= 2:
                 alerts.extend(self._detect_peer_compare(results))
@@ -42,6 +45,12 @@ class AnomalyDetector:
         return self._merge_duplicates(alerts)
 
     # ---------------- RULES ----------------
+    def _all_below_abs_min(self, results) -> bool:
+        pacs = [r.get("pac_W") for r in results if r.get("pac_W") is not None]
+        if not pacs:
+            return False
+        return max(pacs) < self.s.abs_min_watts
+
     def _detect_abnormal_status(self, results):
         out = []
         for r in results:

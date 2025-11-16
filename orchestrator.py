@@ -213,7 +213,14 @@ class Orchestrator:
         alerts = []
 
         if not skip_modbus:
-            alerts.extend(self.detector.detect(read_ok, is_day=is_day))
+            alerts.extend(
+                self.detector.detect(
+                    read_ok,
+                    is_day=is_day,
+                    near_edges=dayinfo.get("near_edges", False),
+                )
+            )
+
 
         # API alerts
         alerts.extend(self.api_checker.generate_alerts(read_ok))

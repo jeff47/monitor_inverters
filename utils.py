@@ -1,9 +1,8 @@
 # utils.py
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from astral.sun import sun
 import pytz
-
 
 class DaylightPolicy:
     """
@@ -13,17 +12,10 @@ class DaylightPolicy:
       - Sleeping-inverter detection
       - Simulation daylight override
       - Skip-Modbus decision logic
+      - Low-light detection near sunrise/sunset
     """
 
     def __init__(self, astral_loc, thresholds, tzname, log, simulation_engine):
-        """
-        Parameters:
-            astral_loc         - Astral LocationInfo
-            thresholds         - cfg.thresholds (morning_grace, evening_grace, etc.)
-            tzname             - site timezone string (e.g., "America/New_York")
-            log                - logger function injected from main()
-            simulation_engine  - SimulationEngine instance (for daylight override)
-        """
         self.astral_loc = astral_loc
         self.thresholds = thresholds
         self.tz = pytz.timezone(tzname)
@@ -51,6 +43,23 @@ class DaylightPolicy:
 
         is_day = sunrise <= dt_local <= sunset
         return is_day, sunrise, sunset
+
+    def _is_near_edges(self, dt_local, sunrise, sunset):
+        """
+        True if within a configurable window of sunrise or sunset.
+        Used to suppress low-PAC alerts when both inverters are low.
+        """
+        # Default window: 45 minutes unless configured otherwise
+        win = getattr(self.thresholds, "low_light_window", timedelta(minutes=45))
+
+        # Allow an integer to mean "minutes"
+        if isinstance(win, int):
+            win = timedelta(minutes=win)
+
+        return (
+            sunrise <= dt_local <= sunrise + win or
+            sunset - win <= dt_local <= sunset
+        )
 
     # ---------------------------
     # Decision logic for Modbus checks
@@ -83,6 +92,9 @@ class DaylightPolicy:
         if self.simulation_engine:
             is_day = self.simulation_engine.override_daylight(is_day)
 
+        # NEW: near sunrise/sunset detection
+        near_edges = self._is_near_edges(dt_local, sunrise, sunset)
+
         if results is not None:
             skip_modbus = self.should_skip_modbus(
                 results,
@@ -98,8 +110,10 @@ class DaylightPolicy:
             "is_day": is_day,
             "sunrise": sunrise,
             "sunset": sunset,
+            "near_edges": near_edges,
             "skip_modbus": skip_modbus,
         }
+
 
 SERIAL_RE = re.compile(r"([0-9A-Fa-f]{6,})")
 
