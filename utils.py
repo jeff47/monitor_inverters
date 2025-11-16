@@ -28,7 +28,7 @@ class DaylightPolicy:
         self.thresholds = thresholds
         self.tz = pytz.timezone(tzname)
         self.log = log
-        self.sim = simulation_engine
+        self.simulation_engine = simulation_engine
 
     # ---------------------------
     # Time and daylight calculation
@@ -51,12 +51,6 @@ class DaylightPolicy:
 
         is_day = sunrise <= dt_local <= sunset
         return is_day, sunrise, sunset
-
-    def override_simulation(self, is_day):
-        """
-        Simulation engine may force daylight behavior for test scenarios.
-        """
-        return self.sim.override_daylight(is_day)
 
     # ---------------------------
     # Decision logic for Modbus checks
@@ -82,6 +76,30 @@ class DaylightPolicy:
 
         return False
 
+    def evaluate(self, dt_local, results=None, verbose=False, quiet=False):
+        is_day, sunrise, sunset = self.compute_daylight_window(dt_local)
+
+        # Apply SimulationEngine daylight override once
+        if self.simulation_engine:
+            is_day = self.simulation_engine.override_daylight(is_day)
+
+        if results is not None:
+            skip_modbus = self.should_skip_modbus(
+                results,
+                is_day,
+                verbose,
+                quiet,
+            )
+        else:
+            skip_modbus = False
+
+        return {
+            "dt_local": dt_local,
+            "is_day": is_day,
+            "sunrise": sunrise,
+            "sunset": sunset,
+            "skip_modbus": skip_modbus,
+        }
 
 SERIAL_RE = re.compile(r"([0-9A-Fa-f]{6,})")
 

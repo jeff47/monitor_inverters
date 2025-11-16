@@ -1,16 +1,13 @@
 # inverter_reader.py
 
 from dataclasses import dataclass
-import socket
-from datetime import datetime
-from typing import Any, Dict
+from typing import Any, Dict, List
 import time
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import solaredge_modbus
 from config import InverterConfig
-from utils import status_human
+from utils import status_human, inv_display_from_parts
 
 # ---------------- IDENTITY HELPERS ----------------
 def clean_serial(s: str) -> str:
@@ -186,4 +183,23 @@ class InverterReader:
             "e_total_Wh": 999_999,
             "raw": {},
         }
+
+    @staticmethod
+    def alerts_from_errors(results: List[Dict]) -> List[str]:
+        """
+        Convert Modbus read errors into alert messages.
+
+        Input: list of result dicts from read_all()
+        Output: list of strings like:
+            "SE7600H [740B143C]: Modbus read failed"
+        """
+        alerts = []
+        for r in results:
+            if r.get("error"):
+                display = inv_display_from_parts(
+                    r.get("model"),
+                    r.get("serial"),
+                )
+                alerts.append(f"{display}: Modbus read failed")
+        return alerts
 

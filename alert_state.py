@@ -19,7 +19,7 @@ import json
 import time
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Tuple, Callable
 from threading import Lock
 from utils import clean_serial, inv_display_from_parts
 
@@ -237,6 +237,43 @@ class AlertStateManager:
 
         self._save()
         return alerts_emitted
+
+    def process_alerts(
+        self,
+        messages: List[str],
+        key_func: Callable[[str], str],
+    ) -> Tuple[List[str], List[str]]:
+        """
+        - Deduplicate alerts by key (keeping the longest message per key)
+        - Record detections
+        - Apply repeat-count / window logic via should_alert()
+
+        Returns:
+            confirmed: alerts that should be sent now
+            suppressed: alerts that were seen but suppressed by thresholds
+        """
+        if not messages:
+            return [], []
+
+        # 1) Deduplicate by key, preferring the longest message
+        unique_by_key: dict[str, str] = {}
+        for msg in messages:
+            k = key_func(msg)
+            if k not in unique_by_key or len(msg) > len(unique_by_key[k]):
+                unique_by_key[k] = msg
+
+        # 2) Record detections and decide which fire
+        confirmed: List[str] = []
+        suppressed: List[str] = []
+
+        for k, msg in unique_by_key.items():
+            _count = self.record_detection(k)
+            if self.should_alert(k):
+                confirmed.append(msg)
+            else:
+                suppressed.append(msg)
+
+        return confirmed, suppressed
 
 
     # -------------------------------------------------------------------

@@ -251,3 +251,9 @@ class SolarEdgeAPIChecker:
                 alerts.append(f"{display}: missing from Cloud API inventory")
 
         return alerts
+
+    def generate_alerts(self, inverter_results):
+        """Return clean list of alert strings from cloud-side checks."""
+        raw = self.check(inverter_results)
+        return raw if raw else []
+

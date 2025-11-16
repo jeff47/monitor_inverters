@@ -13,13 +13,10 @@ SolarEdge inverter monitor via Modbus TCP + optional Cloud API
 """
 
 import sys
-import pytz
 from astral import LocationInfo
 from astral.sun import sun
-from datetime import datetime
 import argparse
 from argparse import RawTextHelpFormatter
-from urllib.parse import urlparse, urlunparse, urlencode
 from pathlib import Path
 import importlib.util
 
@@ -35,8 +32,6 @@ from simulation import SimulationEngine
 from output_formats import json_output
 
 from utils import (
-    clean_serial,
-    inv_display_from_parts,
     extract_serial_from_text,
     status_human,
     DaylightPolicy,
@@ -179,17 +174,10 @@ def main():
         debug=args.debug,
     )
 
-    # Optimizer expectations
-    optimizer_expectations = cfg.optimizers
-    expected_by_serial = {
-        clean_serial(serial): o.count
-        for serial, o in optimizer_expectations.items()
-    }
-
     api_checker = SolarEdgeAPIChecker(
         api_key=cfg.api.api_key,
         site_id=cfg.api.site_id,
-        optimizer_expected_per_inv=expected_by_serial,
+        optimizer_expected_per_inv=cfg.optimizer_expected_by_serial,
         debug=args.debug,
     )
 
@@ -200,16 +188,16 @@ def main():
         )
     )
 
-    # Verbose modbus module info
-    if args.verbose and not args.quiet:
-        print(f"solaredge_modbus version: {getattr(solaredge_modbus, '__version__', '(unknown)')}")
-        print(f"Loaded from: {getattr(solaredge_modbus, '__file__', '(unknown path)')}")
-
     def log(msg, err=False):
         if err:
             print(msg, file=sys.stderr)
         elif not args.quiet:
             print(msg)
+
+    # Verbose modbus module info
+    if args.verbose and not args.quiet:
+        print(f"solaredge_modbus version: {getattr(solaredge_modbus, '__version__', '(unknown)')}")
+        print(f"Loaded from: {getattr(solaredge_modbus, '__file__', '(unknown path)')}")
 
     # Pushover test mode
     if args.test_pushover:
@@ -235,25 +223,30 @@ def main():
     )
 
     dt_local = daylight.now_local()
-    is_day, sunrise, sunset = daylight.compute_daylight_window(dt_local)
-    is_day = daylight.override_simulation(is_day)
-
-
-    # Simulation daylight override
-    is_day = sim.override_daylight(is_day)
-
-    if args.verbose and not args.quiet:
-        log(
-            f"[time] now={dt_local.strftime('%Y-%m-%d %H:%M:%S %Z')} "
-            f"day={is_day} sunrise+grace={sunrise.strftime('%H:%M')} "
-            f"sunset-grace={sunset.strftime('%H:%M')}"
-        )
 
     results, any_success = reader.read_all(
         cfg.inverters,
         verbose=args.verbose,
         quiet=args.quiet,
     )
+
+    dayinfo = daylight.evaluate(
+        dt_local,
+        results=results,
+        verbose=args.verbose,
+        quiet=args.quiet,
+    )
+
+    is_day = dayinfo["is_day"]
+    skip_modbus = dayinfo["skip_modbus"]
+
+    if args.verbose and not args.quiet:
+        log(
+            f"[time] now={dayinfo['dt_local'].strftime('%Y-%m-%d %H:%M:%S %Z')} "
+            f"day={dayinfo['is_day']} "
+            f"sunrise+grace={dayinfo['sunrise'].strftime('%H:%M')} "
+            f"sunset-grace={dayinfo['sunset'].strftime('%H:%M')}"
+        )
 
     # Apply simulation layer
     simulation_info = sim.apply_to_results(results, log, verbose=args.verbose)
@@ -264,76 +257,32 @@ def main():
         return 0
 
     if not any_success:
-        alerts = ["All inverters: Modbus communication failed"]
-
-        confirmed = []
-        for msg in alerts:
-            k = key_for_alert_message(msg)
-            if alert_mgr.should_alert(k):
-                confirmed.append(msg)
-                alert_mgr.record_alert(k)
+        confirmed, suppressed = alert_mgr.process_alerts(
+            ["All inverters: Modbus communication failed"],
+            key_for_alert_message,
+        )
 
         if confirmed:
-            msg = "\n".join(confirmed)
-            log(f"ALERT:\n{msg}")
-            notifier.send("SolarEdge Monitor Alert", msg, priority=1)
-            health.fail(confirmed[0])
-            return 2
-
-        log("Modbus communication failed (suppressed during repeat window)")
-        health.fail("Modbus comm failure")
+            notifier.send(confirmed)
         return 1
-
-    all_sleeping = all(r.get("status") == 2 for r in results if not r.get("error"))
-
-    # Skip Modbus checks at night
-    skip_modbus = daylight.should_skip_modbus(
-        results,
-        is_day,
-        args.verbose,
-        args.quiet,
-    )
-
 
     read_ok = [r for r in results if not r.get("error")]
     alerts = []
     if not skip_modbus:
         alerts = detector.detect(read_ok, is_day=is_day)
 
-
-    cloud_alerts = api_checker.check(read_ok)
-    alerts.extend(cloud_alerts)
+    alerts.extend(api_checker.generate_alerts(read_ok))
 
     recoveries = alert_mgr.update_inverter_states(read_ok, notifier)
     for msg in recoveries:
         log(f"ℹ️ {msg}")
 
-    for r in results:
-        if r.get("error"):
-            display = inv_display_from_parts(r.get("model"), r.get("serial"))
-            alerts.append(f"{display}: Modbus read failed")
-
-    unique_alerts = {}
-    for msg in alerts:
-        k = key_for_alert_message(msg)
-        if k not in unique_alerts or len(msg) > len(unique_alerts[k]):
-            unique_alerts[k] = msg
-    alerts = list(unique_alerts.values())
+    alerts.extend(reader.alerts_from_errors(results))
 
     exit_code = 0
 
     if alerts:
-        confirmed = []
-
-        for msg in alerts:
-            k = key_for_alert_message(msg)
-
-            # 1. ALWAYS record this detection first (not an alert yet)
-            count = alert_mgr.record_detection(k)
-
-            # 2. Now decide if an alert should be emitted
-            if alert_mgr.should_alert(k):
-                confirmed.append(msg)
+        confirmed, suppressed = alert_mgr.process_alerts(alerts, key_for_alert_message)
 
         if confirmed:
             msg = "\n".join(confirmed)
@@ -342,9 +291,8 @@ def main():
             health.fail(confirmed[0])
             exit_code = 2
         else:
-            # Detections were recorded but threshold not reached
+            # Detections were recorded but thresholds not reached
             exit_code = 0
-
     else:
         log("OK: all inverters normal.")
         health.ok("All normal")

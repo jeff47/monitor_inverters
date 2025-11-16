@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import configparser
 from pathlib import Path
 from datetime import timedelta
+from utils import clean_serial
 
 @dataclass
 class OptimizerExpectation:
@@ -184,3 +185,14 @@ class ConfigManager:
             optimizers[key] = OptimizerExpectation(count=count, tolerance=None)
 
         return optimizers
+
+    @property
+    def optimizer_expected_by_serial(self):
+        """
+        Returns a dict:
+            { cleaned_serial: expected_optimizer_count }
+        """
+        return {
+            clean_serial(serial): o.count
+            for serial, o in self.optimizers.items()
+        }
