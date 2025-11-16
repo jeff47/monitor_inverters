@@ -166,6 +166,7 @@ class Orchestrator:
             self.cfg.inverters,
             verbose=self.args.verbose,
             quiet=self.args.quiet,
+            debug=self.args.debug,
         )
 
         # ---------- Daylight evaluation ----------

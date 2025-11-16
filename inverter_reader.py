@@ -131,7 +131,7 @@ class InverterReader:
             "raw": values,
         }
 
-    def read_all(self, inverters: list[InverterConfig], verbose=False, quiet=False):
+    def read_all(self, inverters: list[InverterConfig], verbose=False, quiet=False, debug=False):
         results = []
         any_success = False
 
@@ -151,20 +151,33 @@ class InverterReader:
 
                 results.append(r)
 
+                # -------------------------------
+                # DEBUG: print full raw inverter dict
+                # -------------------------------
+                # if debug:
+                #     import pprint
+                #     print(f"\n[DEBUG][{r.get('id', inv.name)}] RAW MODBUS RECORD:")
+                #     pprint.pprint(r)
+                #     print()  # blank line for clarity
+
+                # -------------------------------
+                # Verbose human-readable summary
+                # -------------------------------
                 if verbose and not quiet and not r.get("error"):
                     pac = r.get("pac_W")
                     vdc = r.get("vdc_V")
                     idc = r.get("idc_A")
                     status = r.get("status")
 
-                    pac_s = f"{pac:.0f}W" if isinstance(pac, (int,float)) else "N/A"
-                    vdc_s = f"{vdc:.1f}V" if isinstance(vdc,(int,float)) else "N/A"
-                    idc_s = f"{idc:.2f}A" if isinstance(idc,(int,float)) else "N/A"
+                    pac_s = f"{pac:.0f}W" if isinstance(pac, (int, float)) else "N/A"
+                    vdc_s = f"{vdc:.1f}V" if isinstance(vdc, (int, float)) else "N/A"
+                    idc_s = f"{idc:.2f}A" if isinstance(idc, (int, float)) else "N/A"
                     status_s = status_human(status)
 
                     print(f"[{r['id']}] (modbus) PAC={pac_s} Vdc={vdc_s} Idc={idc_s} status={status_s}")
 
         return results, any_success
+
 
     def _simulated(self, inv_cfg: InverterConfig) -> dict:
         serial = f"SIM-{inv_cfg.name}"
