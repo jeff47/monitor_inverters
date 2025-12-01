@@ -1,5 +1,8 @@
 # SolarEdge Inverter Monitor
 
+# This project is no longer being developed.  I suggest you look at https://github.com/jeff47/SolaredgeMonitor instead.
+
+
 Monitor one or more **SolarEdge** inverters over **Modbus TCP** and optionally via the **SolarEdge Cloud API**.  This was tested using SolarEdge HD-Wave inverters connected via ethernet.
 
 This tool detects low or zero production, SafeDC conditions, and inverter faults.
